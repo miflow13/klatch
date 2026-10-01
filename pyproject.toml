@@ -20,4 +20,5 @@ driftroom = ["prompts/*.txt"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+addopts = "-m 'not ollama'"
 markers = ["ollama: opt-in test requiring local Ollama and qwen3:4b"]
