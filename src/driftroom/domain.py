@@ -6,14 +6,16 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+    model_config = ConfigDict(
+        extra="forbid", validate_assignment=True, allow_inf_nan=False
+    )
 
 
 class SamplingConfig(StrictModel):
-    temperature: float = 0.8
-    top_p: float = 0.9
-    top_k: int = 40
-    repeat_penalty: float = 1.08
+    temperature: float = Field(default=0.8, ge=0)
+    top_p: float = Field(default=0.9, ge=0, le=1)
+    top_k: int = Field(default=40, ge=0)
+    repeat_penalty: float = Field(default=1.08, gt=0)
 
 
 class AgentTraits(StrictModel):
@@ -53,10 +55,10 @@ class RuntimeConfig(StrictModel):
     startup_mode: Literal["blank", "topic", "environment", "custom"] = "blank"
     runtime_mode: Literal["eco", "balanced", "fast"] = "balanced"
     model_thinking: bool = False
-    recent_context_events: int = 20
-    max_output_tokens: int = 256
-    inference_timeout_seconds: float = 120
-    retry_count: int = 1
+    recent_context_events: int = Field(default=20, ge=0)
+    max_output_tokens: int = Field(default=256, gt=0)
+    inference_timeout_seconds: float = Field(default=120, gt=0)
+    retry_count: int = Field(default=1, ge=0)
 
 
 class RunConfig(StrictModel):

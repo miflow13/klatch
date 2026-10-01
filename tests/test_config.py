@@ -61,6 +61,37 @@ def test_traits_are_bounded_and_runtime_has_required_defaults() -> None:
     assert runtime.retry_count == 1
 
 
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"temperature": -0.1},
+        {"top_p": 1.01},
+        {"top_k": -1},
+        {"repeat_penalty": 0},
+        {"temperature": float("nan")},
+        {"repeat_penalty": float("inf")},
+    ],
+)
+def test_sampling_rejects_out_of_range_and_nonfinite_values(values: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        SamplingConfig(**values)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"recent_context_events": -1},
+        {"max_output_tokens": 0},
+        {"inference_timeout_seconds": 0},
+        {"inference_timeout_seconds": float("inf")},
+        {"retry_count": -1},
+    ],
+)
+def test_runtime_rejects_invalid_operational_values(values: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        RuntimeConfig(**values)
+
+
 def test_canonical_json_is_stable_and_hash_tracks_behavior_parameters() -> None:
     config = load_run_config(Path("driftroom.example.toml"))
     assert canonical_config_json(config) == canonical_config_json(config)
