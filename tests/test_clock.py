@@ -29,6 +29,18 @@ def test_realtime_tracks_monotonic_elapsed_time() -> None:
     assert clock.now_ms() == 2_500
 
 
+def test_realtime_clock_cannot_be_advanced_manually() -> None:
+    monotonic = [200.0]
+    clock = VirtualClock(
+        "realtime", START, initial_ms=1_200, monotonic_fn=lambda: monotonic[0]
+    )
+
+    with pytest.raises(ValueError, match="accelerated"):
+        clock.advance_ms(5_000)
+    monotonic[0] = 202.0
+    assert clock.now_ms() == 3_200
+
+
 def test_reopen_restores_simulated_time_without_offline_catchup() -> None:
     old_start = datetime(2020, 1, 1, tzinfo=timezone.utc)
     clock = VirtualClock(

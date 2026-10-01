@@ -37,6 +37,8 @@ class VirtualClock:
         return self._sim_ms
 
     def advance_ms(self, delta_ms: int) -> None:
+        if self.mode != "accelerated":
+            raise ValueError("advance_ms is only available in accelerated mode")
         if delta_ms < 0:
             raise ValueError("simulation time cannot move backwards")
         self._sim_ms += delta_ms
