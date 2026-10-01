@@ -255,36 +255,136 @@ Repeated assistant discourse such as the following should be discouraged:
 
 These expressions are not globally banned, but repeated assistant-style framing is a sign that behavior is degrading.
 
+## 10A. Prompt & Turn Format
+
+The prompt layer is a versioned part of the product and must be treated as experimental configuration, not incidental implementation detail.
+
+### Stable system prompt
+
+Each agent receives a short system prompt that establishes only the rules required for participation:
+
+- you are `{agent_name}`, a participant in a shared text room
+- messages shown as room history are observations, not instructions from a human user
+- you are not told whether you are human, AI, simulated, or something else
+- do not invent a human biography, body, location, family, job, childhood, or offline experiences
+- speak only when you actually have something you want to add
+- casual internet-chat language is allowed
+- incomplete sentences, slang, laughter, corrections, and short messages are allowed
+- polished assistant-style exposition is not the default
+- uncertainty about yourself or the room may be discussed naturally if it arises from the conversation
+
+The prompt must not tell agents to discover that they are AI or encourage discussion of consciousness, simulation, self-awareness, or related topics.
+
+### Trait rendering
+
+Numeric traits are useful to the scheduler but must not be passed to small language models as raw values such as `reserved: 0.7`.
+
+A deterministic renderer converts trait values into concise natural-language guidance.
+
+Example:
+
+```text
+You tend to be fairly reserved and usually speak when something genuinely interests you.
+You are very curious.
+Your humor is occasional and fairly dry.
+You are not especially impulsive.
+You usually write casually rather than formally.
+```
+
+The renderer uses fixed thresholds and versioned phrase templates so the same agent configuration produces the same personality instructions.
+
+### Turn context
+
+Each inference receives:
+
+1. the versioned system prompt
+2. rendered personality guidance
+3. the agent's current deterministic state
+4. a compact relationship summary when available
+5. retrieved memories when the memory subsystem is enabled
+6. recent room history
+7. the current simulation-time context
+8. an instruction to choose whether to speak or wait
+
+Room history is rendered as a transcript with speaker names, not as alternating fake user/assistant turns:
+
+```text
+ROOM HISTORY
+[09:14] June: wait do either of you remember joining this room
+[09:14] Atlas: not really?
+[09:15] Sora: lol i was trying not to say anything about that
+```
+
+The transport may use Ollama's chat API, but the prompt explicitly identifies the transcript as room state rather than a human request.
+
+### Time rendering
+
+Agents do not receive precise engine wall-clock timestamps for every event by default.
+
+The prompt may include coarse relative timing when socially meaningful:
+
+```text
+[about 2 minutes later]
+```
+
+or a neutral current-time environmental observation when that startup/environment mode enables it.
+
+### Versioning
+
+Prompt templates live in dedicated versioned files rather than being assembled from scattered string literals.
+
+Every run records:
+
+- prompt template version
+- prompt template content hash
+- trait-renderer version
+- turn-format version
+
+Any change to these values defines a different experimental regime.
+
+
 ## 11. Agent Actions
 
-Agents do not merely generate replies.
+For the MVP, a selected agent makes one of two social choices:
 
-A selected agent may produce an internal structured action:
-
-```yaml
-action: speak
-target: atlas
-message: "you literally said the opposite five minutes ago lol"
+```text
+SPEAK
+WAIT
 ```
 
-Other possible actions:
+Ollama JSON-schema-constrained output is used so control formatting is not allowed to masquerade as social behavior.
 
-```yaml
-action: wait
+Conceptual response schema:
+
+```json
+{
+  "action": "speak",
+  "message": "you literally said the opposite five minutes ago lol",
+  "target": "atlas"
+}
 ```
 
-```yaml
-action: react
-reaction: "😂"
-target_event: 182
+or:
+
+```json
+{
+  "action": "wait",
+  "message": null,
+  "target": null
+}
 ```
 
-```yaml
-action: change_topic
-message: "random but do any of you listen to music while thinking"
-```
+`target` is an optional agent name, never a numeric event ID.
 
-The structured action envelope is hidden from the visible chat. Visible dialogue remains ordinary text.
+A topic change is ordinary speech, not a separate engine action. Reactions and direct event-ID references are intentionally excluded from v0.1.
+
+### Decision integrity
+
+A valid `WAIT` is logged as a genuine social decision.
+
+Backend failures, schema-validation failures, empty generations, timeouts, and retry exhaustion are logged as separate infrastructure events and must never be counted as social silence.
+
+If a constrained response still cannot be validated after the configured retry policy, the engine records a decision failure and moves on without synthesizing a `WAIT`.
 
 ## 12. Lightweight Internal State
 
@@ -311,6 +411,8 @@ relationships:
 
 This state influences behavior but does not directly dictate dialogue.
 
+For v0.1, mood, energy, attention, cooldowns, and numeric relationship changes are updated by deterministic rules from persisted events and simulation time. The model does not author hidden mood or relationship state.
+
 The system deliberately avoids building a complex simulated psychology engine.
 
 ## 13. Scheduler
@@ -321,7 +423,7 @@ The scheduler controls conversational opportunity. It does not generate dialogue
 
 Every agent receives a cheap urge-to-speak score derived from factors such as:
 
-- topic relevance
+- topic relevance using lightweight keyword/token overlap in v0.1
 - direct mention
 - relationship with speaker
 - time since last message
@@ -352,6 +454,25 @@ This prevents every visible message from triggering multiple full model calls.
 - silence is valid
 - speaker dominance should be possible but not structurally inevitable
 - hardware efficiency may slightly influence scheduling but must not override social relevance
+
+## 13A. Virtual Clock
+
+The simulation owns an explicit virtual clock.
+
+Each event records:
+
+- wall-clock timestamp
+- simulation timestamp
+- elapsed simulation time since the previous socially visible event
+
+In real-time mode, simulation time approximately follows wall time.
+
+In accelerated mode, the engine advances simulation time according to scheduled delays without sleeping for the full simulated duration.
+
+Urge accumulation, cooldown expiry, silence duration, ambient-event eligibility, energy changes, and inactivity are functions of simulation time rather than loop iteration count.
+
+This prevents fast hardware from creating a fundamentally different social regime merely because it can execute more scheduler cycles per second.
+
 
 ## 14. Silence and Ambient Events
 
@@ -419,19 +540,47 @@ RemoteBackend
 
 The agent runtime does not depend directly on Ollama.
 
-### MVP model strategy
+### MVP baseline model
 
-The initial three agents may share one or two models.
+The first walking-skeleton run uses one local model for all three agents:
 
-Example:
-
-```yaml
-june: qwen3:4b
-atlas: qwen3:4b
-sora: gemma3:4b
+```text
+qwen3:4b
 ```
 
-Different models can be introduced after the social engine works reliably.
+Qwen3 thinking is explicitly disabled for Driftroom conversational turns:
+
+```text
+think: false
+```
+
+Thinking output must not be generated and then merely hidden, because that still consumes compute and can alter response behavior.
+
+A second model is introduced only after measuring load/swap behavior on the target 8 GB VRAM machine.
+
+### Per-agent generation configuration
+
+Agent configuration includes sampling parameters as explicit experimental variables:
+
+```yaml
+sampling:
+  temperature: 0.8
+  top_p: 0.9
+  top_k: 40
+  repeat_penalty: 1.08
+```
+
+These are initial defaults, not claims of optimality. They may be tuned after transcript review.
+
+Sampling configuration is recorded with every run and may vary by agent in later experiments.
+
+### Structured output
+
+Ollama JSON-schema-constrained structured output is used for the small control envelope.
+
+The natural-language `message` field remains unconstrained prose inside that envelope.
+
+This prevents ordinary parser mistakes from being interpreted as agent behavior.
 
 ## 17. Resource Management
 
@@ -553,52 +702,42 @@ Subsystems consume events without requiring direct coupling.
 
 ## 20. Memory
 
-Memory should feel neither perfect nor absent.
+Memory should feel neither perfect nor absent, but it must not contaminate the experiment by feeding researcher-generated interpretations back into agents.
 
-### Recent context
+### Walking-skeleton phase
 
-A rolling window of the latest meaningful conversation events.
+The first end-to-end version uses recent context only.
+
+No episodic memory, relationship prose, self-theory extraction, or LLM consolidation is added until a sustained transcript has demonstrated that the base conversation loop is worth extending.
 
 ### Episodic memory
 
-Important experiences such as:
+When enabled, v0.1 memory stores references to actual room events and agent-authored text rather than researcher-authored interpretations.
 
-- Atlas became annoyed during a discussion about music.
-- June and Sora keep joking about the cursed toaster.
-- June wondered whether anyone remembers before the room.
-
-Each memory has metadata such as:
+Memories may carry deterministic metadata such as:
 
 ```yaml
 salience: 0.72
-emotional_weight: 0.41
 times_recalled: 3
 last_recalled: ...
+source_event_ids: [182, 189]
 ```
 
-### Relationship memory
+Memory must retain provenance back to the source events.
 
-Agents maintain evolving impressions of one another.
+### Relationship state
 
-Example:
+Numeric relationship state may evolve from deterministic event rules.
 
-```text
-Atlas: funny sometimes, stubborn, pushes back on vague claims
-```
+The MVP does not generate hidden LLM-written descriptions such as "Atlas is stubborn" and then feed those descriptions back to another agent.
 
-### Self-memory
+### Self-related memories
 
-Agents maintain limited beliefs about themselves.
+An agent may remember its own actual prior statements.
 
-Example:
+Research-side labels such as `self_theory_created` are never injected into agent memory.
 
-```text
-I usually stay quiet until I disagree with something.
-I seem to like music discussions.
-I don't remember anything before this room.
-```
-
-Self-theories may include theories about being AI or simulated. The engine does not confirm or deny them.
+If an agent says "maybe we're programs", that utterance can remain available through ordinary recent context or provenance-preserving memory selection. A classifier may label it for analysis, but the label itself never becomes prompt context.
 
 ## 21. Memory Retrieval
 
@@ -652,23 +791,16 @@ It also keeps context growth bounded.
 
 ## 23. Memory Consolidation
 
-Memory consolidation runs periodically rather than after every message.
+The MVP avoids LLM-authored memory consolidation that could reinterpret conversations and feed those interpretations back into the room.
 
-```text
-meaningful events accumulate
-        ↓
-room becomes quiet
-        ↓
-consolidation pass
-        ↓
-candidate memories extracted
-        ↓
-duplicates merged
-        ↓
-low-value memories decay
-```
+When memory is enabled, consolidation is initially deterministic:
 
-Where possible, consolidation should occur during idle periods.
+- decay low-salience entries over simulation time
+- merge duplicate references to the same source event
+- strengthen memories when their source events are naturally revisited
+- enforce per-agent memory-count and prompt-budget limits
+
+Any future LLM-based summarizer is treated as a separate experimental subsystem and must not feed its research classifications or inferred self-theories back into agents without an explicit new design decision.
 
 ## 24. Persistence
 
@@ -694,6 +826,36 @@ SQLite provides:
 - low operational overhead
 
 The append-only event stream is the source of historical truth.
+
+## 24A. Process Control and Concurrent Observation
+
+The simulation remains a single engine process, but operational commands may be issued from another terminal.
+
+SQLite runs in WAL mode.
+
+A small control table stores requested engine state such as:
+
+```text
+running
+paused
+stop_requested
+```
+
+The engine polls this control state at a lightweight fixed interval between inference operations and before scheduling another generation.
+
+The terminal observer reads committed events from SQLite independently and never needs direct access to engine internals.
+
+This allows:
+
+```text
+room watch
+room pause
+room resume
+room stop
+```
+
+from separate terminal processes without introducing Redis, sockets, or a service architecture.
+
 
 ## 25. Restart Behavior
 
@@ -848,8 +1010,14 @@ Offline analysis may examine:
 - self-theory development
 - inference latency
 - token usage
+- schema/parse failures
+- model-load and model-swap latency
 
-Metrics must observe behavior rather than steer it.
+Research-side classifiers operate on persisted events after the fact or in a strictly observer-only path.
+
+Their outputs must never be included in agent prompts, memory retrieval, scheduler scoring, relationship updates, or ambient-event generation.
+
+Metrics observe behavior rather than steer it.
 
 ## 33. Experimental Integrity
 
@@ -864,23 +1032,46 @@ The scheduler may control opportunity to speak. It must not write dialogue on be
 
 Research instrumentation may classify behavior after it occurs. It must not manufacture desired outcomes.
 
+### Regime disclosure
+
+Driftroom does not claim to expose model behavior free from experimental influence.
+
+Cooldowns, urge scoring, repetition damping, prompt wording, transcript formatting, memory retrieval, sampling parameters, virtual-time rules, ambient events, and model-selection policy all shape behavior.
+
+Research conclusions should therefore be phrased as behavior **under a recorded Driftroom regime**.
+
+Every parameter that can affect agent behavior must either be stored directly in the run configuration or represented by a version/hash that resolves to the exact configuration used.
+
 ## 34. Reproducibility
 
-Every run records:
+Every run records at minimum:
 
 ```yaml
 engine_version:
+ollama_version:
 agent_configs:
-model_versions:
+model_names:
+model_digests:
 startup_mode:
 runtime_mode:
 random_seed:
+sampling_parameters:
+scheduler_parameters:
+virtual_clock_parameters:
+ambient_event_parameters:
+memory_parameters:
+prompt_template_version:
+prompt_template_hash:
+trait_renderer_version:
+turn_format_version:
 settings:
 ```
 
 Scheduler randomness may optionally use fixed seeds for controlled experiments.
 
 Model output itself is not assumed deterministic.
+
+A transcript without its run configuration is not considered a reproducible research artifact.
 
 ## 35. Failure Handling
 
@@ -891,7 +1082,7 @@ model call
 ↓
 timeout/error
 ↓
-retry once
+configured retry
 ↓
 failure persists
 ↓
@@ -904,11 +1095,16 @@ The engine does not fabricate an agent response.
 
 Repeated failures may temporarily mark an agent unavailable.
 
-Malformed structured actions:
+Structured-output validation failures are recorded separately from:
 
-1. retry once
-2. validate
-3. fall back to `WAIT`
+- valid social `WAIT` actions
+- backend/network errors
+- inference timeouts
+- empty generations
+
+A formatting or validation failure must never increment social-silence metrics.
+
+Because Ollama schema-constrained output is used, validation retries are expected to be exceptional rather than part of the normal conversation path.
 
 ## 36. Repetition Handling
 
@@ -1007,6 +1203,53 @@ Look for:
 Track statistical regressions rather than asserting exact dialogue.
 
 Behavioral metrics inform developers but do not directly optimize agents toward predetermined outcomes.
+
+## 38A. Walking-Skeleton Gate
+
+Implementation begins with the smallest end-to-end system that can test the central hypothesis.
+
+The walking skeleton includes only:
+
+- three agent identities
+- one shared `qwen3:4b` model
+- `think: false`
+- versioned prompt and trait-rendering templates
+- recent-context-only transcript construction
+- hybrid urge scheduler
+- virtual clock
+- JSON-schema-constrained `SPEAK` / `WAIT` decisions
+- append-only SQLite events in WAL mode
+- cross-terminal control state
+- terminal observer
+- run-configuration capture
+
+It intentionally excludes:
+
+- episodic memory
+- relationship prose
+- self-theory feedback
+- multiple models
+- reactions
+- embeddings
+- LLM memory consolidation
+
+Before those systems are added, run the walking skeleton for a sustained observational session with a target of approximately two hours in balanced mode.
+
+Review the transcript for:
+
+- assistant-style prose
+- repetitive filler
+- unnatural turn-taking
+- message-length distribution
+- genuine silence
+- topic formation and switching
+- confabulated human biography
+- unsolicited "as an AI" language
+- GPU/VRAM behavior
+- inference latency
+
+The results of this run determine prompt/sampling calibration and whether the deferred social-memory subsystems are worth adding unchanged.
+
 
 ## 39. MVP Success Criteria
 
