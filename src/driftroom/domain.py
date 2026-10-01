@@ -45,10 +45,10 @@ class SchedulerConfig(StrictModel):
     cooldown_penalty: float = 1.00
     random_jitter: float = 0.15
     candidate_threshold: float = 0.35
-    decision_tick_ms: int = 5_000
-    silence_ambient_after_ms: int = 300_000
-    ambient_min_interval_ms: int = 900_000
-    speaker_cooldown_ms: int = 20_000
+    decision_tick_ms: int = Field(default=5_000, gt=0)
+    silence_ambient_after_ms: int = Field(default=300_000, gt=0)
+    ambient_min_interval_ms: int = Field(default=900_000, gt=0)
+    speaker_cooldown_ms: int = Field(default=20_000, ge=0)
 
 
 class RuntimeConfig(StrictModel):
