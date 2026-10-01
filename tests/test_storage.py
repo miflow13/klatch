@@ -1,6 +1,7 @@
 """Durability and control behavior at the EventStore boundary."""
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
@@ -99,9 +100,54 @@ def test_event_and_derived_state_commit_together(tmp_path) -> None:
     with pytest.raises(sqlite3.IntegrityError):
         store.commit_event(
             message(200),
-            [StateUpdate(table="agent_state", values={"run_id": "missing", "agent_id": "june", "energy": 0.5, "attention": 0.7, "mood": "neutral", "updated_sim_ms": 200})],
+            [StateUpdate(table="agent_state", values={"run_id": "run-1", "agent_id": "missing", "energy": 0.5, "attention": 0.7, "mood": "neutral", "updated_sim_ms": 200})],
         )
     assert [event.id for event in store.read_events("run-1")] == [event_id]
+    store.close()
+
+
+@pytest.mark.parametrize("table", ["agent_state", "relationships", "memories"])
+def test_state_update_cannot_cross_event_run(tmp_path, table: str) -> None:
+    path = tmp_path / "room.sqlite3"
+    store = EventStore(path)
+    store.initialize()
+    store.create_run(run_record())
+    store.create_run(replace(run_record(), run_id="run-2", room_id="room-2"))
+    source_id = store.append_event(replace(message(10), run_id="run-2"))
+    values_by_table = {
+        "agent_state": {"run_id": "run-2", "agent_id": "june", "energy": 0.5, "attention": 0.7, "mood": "neutral", "updated_sim_ms": 100},
+        "relationships": {"run_id": "run-2", "source_agent_id": "june", "target_agent_id": "milo", "familiarity": 0.2, "affinity": 0.0, "tension": 0.0, "updated_sim_ms": 100},
+        "memories": {"run_id": "run-2", "agent_id": "june", "source_event_id": source_id, "salience": 0.3, "times_recalled": 0, "last_recalled_ms": 100},
+    }
+
+    with pytest.raises(ValueError, match="run"):
+        store.commit_event(message(100), [StateUpdate(table=table, values=values_by_table[table])])
+
+    assert store.read_events("run-1") == []
+    assert [event.id for event in store.read_events("run-2")] == [source_id]
+    with sqlite3.connect(path) as db:
+        assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
+    store.close()
+
+
+def test_memory_source_event_must_belong_to_update_run(tmp_path) -> None:
+    path = tmp_path / "room.sqlite3"
+    store = EventStore(path)
+    store.initialize()
+    store.create_run(run_record())
+    store.create_run(replace(run_record(), run_id="run-2", room_id="room-2"))
+    other_run_source = store.append_event(replace(message(10), run_id="run-2"))
+    memory = StateUpdate(
+        table="memories",
+        values={"run_id": "run-1", "agent_id": "june", "source_event_id": other_run_source, "salience": 0.3, "times_recalled": 0, "last_recalled_ms": 100},
+    )
+
+    with pytest.raises(ValueError, match="source_event_id"):
+        store.commit_event(message(100), [memory])
+
+    assert store.read_events("run-1") == []
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT COUNT(*) FROM memories").fetchone() == (0,)
     store.close()
 
 

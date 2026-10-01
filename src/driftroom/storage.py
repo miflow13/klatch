@@ -199,16 +199,25 @@ class EventStore:
             event_id = cursor.lastrowid
             assert event_id is not None
             for update in state_updates:
-                self._apply_state_update(update)
+                self._apply_state_update(update, event.run_id)
         return event_id
 
-    def _apply_state_update(self, update: StateUpdate) -> None:
+    def _apply_state_update(self, update: StateUpdate, event_run_id: str) -> None:
         table = update.table
         if table not in _STATE_KEYS:
             raise ValueError(f"unsupported state table: {table}")
         values = update.values
         if not values or not set(values) <= _STATE_COLUMNS[table] or not set(_STATE_KEYS[table]) <= set(values):
             raise ValueError(f"invalid columns for {table}")
+        if values["run_id"] != event_run_id:
+            raise ValueError("state update run_id must match event run_id")
+        if table == "memories":
+            source = self._db.execute(
+                "SELECT 1 FROM events WHERE id=? AND run_id=?",
+                (values["source_event_id"], event_run_id),
+            ).fetchone()
+            if source is None:
+                raise ValueError("memory source_event_id must belong to the event run")
         columns = tuple(values)
         names = ", ".join(columns)
         placeholders = ", ".join("?" for _ in columns)
