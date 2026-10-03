@@ -132,7 +132,7 @@ def test_canonical_json_matches_independently_written_expected_string() -> None:
         '"model_thinking":false,"recent_context_events":20,"retry_count":1,'
         '"runtime_mode":"balanced","startup_mode":"blank"},'
         '"scheduler":{"ambient_min_interval_ms":900000,"base_bias":-0.35,'
-        '"candidate_threshold":0.35,"cooldown_penalty":1.0,"decision_tick_ms":5000,'
+        '"candidate_threshold":0.2,"cooldown_penalty":1.0,"decision_tick_ms":5000,'
         '"direct_mention_bonus":0.55,"elapsed_weight":0.3,"random_jitter":0.15,'
         '"recent_speaker_penalty":0.45,"relationship_weight":0.1,'
         '"silence_ambient_after_ms":300000,"speaker_cooldown_ms":20000,'

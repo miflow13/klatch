@@ -105,6 +105,21 @@ def test_long_silence_is_coarse_and_non_message_events_are_hidden() -> None:
     assert "agent_wait" not in rendered
 
 
+def test_environment_events_render_as_neutral_unattributed_room_lines() -> None:
+    prompting = importlib.import_module("driftroom.prompting")
+    quiet = StoredEvent(
+        2, "run-1", "2026-10-01T12:00:00Z", 300_000, "environment", None,
+        {"text": "the room has been quiet for a while"},
+    )
+    rendered = prompting.render_room_history(
+        [room_event(1, 0, "June", "hey"), quiet], now_sim_ms=300_000,
+    )
+    assert rendered == (
+        "[00:00] June: hey\n"
+        "[about 5 minutes later]\n"
+        "[00:05] (the room has been quiet for a while)"
+    )
+
 def test_turn_messages_keep_room_history_inside_observed_context() -> None:
     prompting = importlib.import_module("driftroom.prompting")
     context = prompting.TurnContext(

@@ -5,6 +5,11 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+# Event types that participants can see; "environment" events are neutral,
+# unattributed room descriptions with payload {"text": ...}.
+VISIBLE_EVENT_TYPES: frozenset[str] = frozenset({"message", "environment"})
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid", validate_assignment=True, allow_inf_nan=False
@@ -44,7 +49,7 @@ class SchedulerConfig(StrictModel):
     recent_speaker_penalty: float = 0.45
     cooldown_penalty: float = 1.00
     random_jitter: float = 0.15
-    candidate_threshold: float = 0.35
+    candidate_threshold: float = 0.20
     decision_tick_ms: int = Field(default=5_000, gt=0)
     silence_ambient_after_ms: int = Field(default=300_000, gt=0)
     ambient_min_interval_ms: int = Field(default=900_000, gt=0)

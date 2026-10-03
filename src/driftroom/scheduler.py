@@ -1,13 +1,13 @@
 """Cheap urge scoring before any model inference is considered."""
 
-import asyncio
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import re
 from random import Random
+import time
 
 from .clock import VirtualClock
-from .domain import AgentConfig, SchedulerConfig
+from .domain import VISIBLE_EVENT_TYPES, AgentConfig, SchedulerConfig
 from .storage import StoredEvent
 
 
@@ -39,8 +39,16 @@ class Scheduler:
         attention: Mapping[str, float] | None = None,
         relationship_affinity: Mapping[str, float] | None = None,
     ) -> list[CandidateScore]:
-        visible = [event for event in events if event.type == "message"]
-        latest_text = str(visible[-1].payload.get("message", "")) if visible else ""
+        visible = [event for event in events if event.type in VISIBLE_EVENT_TYPES]
+        messages = [event for event in visible if event.type == "message"]
+        # Only a message can name or echo anyone; environment text is never matched.
+        latest_message = (
+            visible[-1] if visible and visible[-1].type == "message" else None
+        )
+        latest_text = (
+            str(latest_message.payload.get("message", ""))
+            if latest_message is not None else ""
+        )
         latest_tokens = set(re.findall(r"\b\w+\b", latest_text.casefold()))
         scores = []
         for agent in agents:
@@ -64,7 +72,7 @@ class Scheduler:
             ):
                 score += self.config.direct_mention_bonus
                 reasons.append("direct_mention")
-            own_messages = [event for event in visible if event.agent_id == agent.id]
+            own_messages = [event for event in messages if event.agent_id == agent.id]
             last_own_ms = own_messages[-1].sim_ms if own_messages else 0
             elapsed_fraction = min(
                 1.0, max(0, now_ms - last_own_ms) / self.config.silence_ambient_after_ms
@@ -90,16 +98,18 @@ class Scheduler:
                 reasons.append("cooldown")
             if (
                 self.config.recent_speaker_penalty
-                and visible
-                and visible[-1].agent_id == agent.id
+                and latest_message is not None
+                and latest_message.agent_id == agent.id
             ):
                 score -= self.config.recent_speaker_penalty
                 reasons.append("recent_speaker")
             if self.config.random_jitter:
-                score += self.rng.uniform(
+                jitter = self.rng.uniform(
                     -self.config.random_jitter, self.config.random_jitter
                 )
-                reasons.append("jitter")
+                if jitter:
+                    score += jitter
+                    reasons.append("jitter")
             scores.append(CandidateScore(agent.id, score, tuple(reasons)))
         return sorted(scores, key=lambda candidate: candidate.score, reverse=True)
 
@@ -113,25 +123,30 @@ class Scheduler:
         attention: Mapping[str, float] | None = None,
         relationship_affinity: Mapping[str, float] | None = None,
     ) -> CandidateScore | None:
-        scores = self.score_agents(
-            agents,
-            events,
-            now_ms,
-            energy=energy,
-            attention=attention,
-            relationship_affinity=relationship_affinity,
+        return self.select_from(
+            self.score_agents(
+                agents,
+                events,
+                now_ms,
+                energy=energy,
+                attention=attention,
+                relationship_affinity=relationship_affinity,
+            )
         )
+
+    def select_from(self, scores: Sequence[CandidateScore]) -> CandidateScore | None:
+        """Pick the top of an already scored list without drawing new jitter."""
         if scores and scores[0].score >= self.config.candidate_threshold:
             return scores[0]
         return None
 
-    async def wait_for_next_tick(
+    def wait_for_next_tick(
         self,
         clock: VirtualClock,
         *,
-        sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         if clock.mode == "realtime":
-            await sleep_fn(self.config.decision_tick_ms / 1_000)
+            sleep_fn(self.config.decision_tick_ms / 1_000)
         else:
             clock.advance_ms(self.config.decision_tick_ms)

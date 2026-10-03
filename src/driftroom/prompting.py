@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 
-from .domain import AgentConfig
+from .domain import VISIBLE_EVENT_TYPES, AgentConfig
 from .storage import StoredEvent
 
 
@@ -59,22 +59,30 @@ def render_traits(agent: AgentConfig) -> str:
 
 
 def render_room_history(events: Sequence[StoredEvent], now_sim_ms: int) -> str:
-    """Show committed speech as a room transcript, with coarse silence cues."""
+    """Show committed speech and neutral environment events as a room transcript.
+
+    Environment events are unattributed descriptions rendered in parentheses;
+    coarse silence cues measure gaps between any visible events.
+    """
     lines: list[str] = []
-    last_message_ms: int | None = None
+    last_visible_ms: int | None = None
     for event in events:
-        if event.type != "message":
+        if event.type not in VISIBLE_EVENT_TYPES:
             continue
-        if last_message_ms is not None and event.sim_ms - last_message_ms >= 300_000:
-            minutes = round((event.sim_ms - last_message_ms) / 60_000)
+        if last_visible_ms is not None and event.sim_ms - last_visible_ms >= 300_000:
+            minutes = round((event.sim_ms - last_visible_ms) / 60_000)
             lines.append(f"[about {minutes} minutes later]")
         minutes = event.sim_ms // 60_000
-        speaker = str(event.payload.get("speaker") or event.agent_id or "Room")
-        message = str(event.payload["message"])
-        lines.append(f"[{minutes // 60:02d}:{minutes % 60:02d}] {speaker}: {message}")
-        last_message_ms = event.sim_ms
-    if last_message_ms is not None and now_sim_ms - last_message_ms >= 300_000:
-        minutes = round((now_sim_ms - last_message_ms) / 60_000)
+        stamp = f"[{minutes // 60:02d}:{minutes % 60:02d}]"
+        if event.type == "environment":
+            lines.append(f"{stamp} ({event.payload['text']})")
+        else:
+            speaker = str(event.payload.get("speaker") or event.agent_id or "Room")
+            message = str(event.payload["message"])
+            lines.append(f"{stamp} {speaker}: {message}")
+        last_visible_ms = event.sim_ms
+    if last_visible_ms is not None and now_sim_ms - last_visible_ms >= 300_000:
+        minutes = round((now_sim_ms - last_visible_ms) / 60_000)
         lines.append(f"[about {minutes} minutes later]")
     return "\n".join(lines)
 

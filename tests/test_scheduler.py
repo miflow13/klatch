@@ -1,16 +1,22 @@
 """Cheap, deterministic conversational opportunity scoring."""
 
-import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 from random import Random
 
 import pytest
 from pydantic import ValidationError
 
-from driftroom.domain import AgentConfig, AgentTraits, SchedulerConfig
+from driftroom.config import load_run_config
+from driftroom.domain import (
+    VISIBLE_EVENT_TYPES, AgentConfig, AgentTraits, SchedulerConfig,
+)
 from driftroom.clock import VirtualClock
-from driftroom.scheduler import Scheduler
+from driftroom.scheduler import CandidateScore, Scheduler
 from driftroom.storage import StoredEvent
+
+
+EXAMPLE_CONFIG = Path(__file__).resolve().parents[1] / "driftroom.example.toml"
 
 
 def agent(agent_id: str, name: str, *, reserved: float = 0.5) -> AgentConfig:
@@ -54,13 +60,28 @@ def test_experimental_v1_scheduler_defaults_are_recorded() -> None:
         "recent_speaker_penalty": 0.45,
         "cooldown_penalty": 1.00,
         "random_jitter": 0.15,
-        "candidate_threshold": 0.35,
+        "candidate_threshold": 0.20,
         "decision_tick_ms": 5_000,
         "silence_ambient_after_ms": 300_000,
         "ambient_min_interval_ms": 900_000,
         "speaker_cooldown_ms": 20_000,
     }
 
+
+def test_default_regime_lets_every_agent_qualify_and_room_recover() -> None:
+    config = load_run_config(EXAMPLE_CONFIG)
+    scheduler = Scheduler(config.scheduler, rng=Random(1))
+    agents = config.agents
+
+    blank = [scheduler.select_candidate(agents, [], 10_000_000) for _ in range(2_000)]
+    after_milo = [message(1, 10_000_000, "milo", "the light in here is kind of strange")]
+    recovering = [
+        scheduler.select_candidate(agents, after_milo, 10_060_000) for _ in range(2_000)
+    ]
+
+    assert {c.agent_id for c in blank if c is not None} == {a.id for a in agents}
+    assert None in blank
+    assert {c.agent_id for c in recovering if c is not None} - {"milo"}
 
 def test_reasons_name_only_nonzero_score_contributions() -> None:
     june = agent("june", "June")
@@ -139,6 +160,38 @@ def test_elapsed_urge_uses_simulated_milliseconds() -> None:
     assert "elapsed" in later.reasons
 
 
+def environment(event_id: int, sim_ms: int, text: str) -> StoredEvent:
+    return StoredEvent(
+        event_id, "run-1", "2026-10-01T12:00:00Z", sim_ms,
+        "environment", None, {"text": text},
+    )
+
+
+def test_environment_events_are_visible_but_never_mentions() -> None:
+    milo = agent("milo", "Milo")
+    june = agent("june", "June")
+    scheduler = Scheduler(
+        neutral_config(
+            recent_speaker_penalty=0.45, direct_mention_bonus=0.55,
+            topic_overlap_weight=0.25,
+        ),
+        rng=Random(3),
+    )
+    history = [
+        message(1, 0, "milo", "has june returned"),
+        environment(2, 300_000, "June has returned"),
+    ]
+
+    scores = {
+        score.agent_id: score
+        for score in scheduler.score_agents([milo, june], history, 300_000)
+    }
+
+    assert VISIBLE_EVENT_TYPES == frozenset({"message", "environment"})
+    assert "recent_speaker" not in scores["milo"].reasons
+    assert "topic_overlap" not in scores["milo"].reasons
+    assert "direct_mention" not in scores["june"].reasons
+
 def test_traits_and_optional_state_scale_urge() -> None:
     june = agent("june", "June", reserved=0.2)
     scheduler = Scheduler(
@@ -170,14 +223,60 @@ def test_fixed_seed_reproduces_jitter_and_candidate_order() -> None:
     assert any(candidate.score != 0 for candidate in first)
 
 
+class ZeroUniform(Random):
+    def uniform(self, a: float, b: float) -> float:
+        return 0.0
+
+
+def test_zero_jitter_draw_is_not_reported_as_a_reason() -> None:
+    june = agent("june", "June")
+    scheduler = Scheduler(neutral_config(random_jitter=0.15), rng=ZeroUniform(3))
+
+    score = scheduler.score_agents([june], [], 0)[0]
+
+    assert score.score == 0
+    assert "jitter" not in score.reasons
+
 def test_selection_returns_none_below_threshold_and_accepts_boundary() -> None:
     june = agent("june", "June")
-    below = Scheduler(neutral_config(base_bias=0.349), rng=Random(3))
-    boundary = Scheduler(neutral_config(base_bias=0.35), rng=Random(3))
+    below = Scheduler(
+        neutral_config(base_bias=0.349, candidate_threshold=0.35), rng=Random(3)
+    )
+    boundary = Scheduler(
+        neutral_config(base_bias=0.35, candidate_threshold=0.35), rng=Random(3)
+    )
 
     assert below.select_candidate([june], [], 0) is None
     assert boundary.select_candidate([june], [], 0).agent_id == "june"
 
+
+def test_select_from_reuses_one_scored_list_without_drawing_rng() -> None:
+    agents = [agent("june", "June"), agent("atlas", "Atlas"), agent("sora", "Sora")]
+    config = neutral_config(base_bias=0.40, random_jitter=0.15, candidate_threshold=0.20)
+    scheduler = Scheduler(config, rng=Random(7))
+
+    scores = scheduler.score_agents(agents, [], 0)
+    state_after_scoring = scheduler.rng.getstate()
+    first = scheduler.select_from(scores)
+    second = scheduler.select_from(scores)
+
+    assert first is scores[0]
+    assert second is first
+    assert scheduler.rng.getstate() == state_after_scoring
+    assert scheduler.select_from([]) is None
+    assert scheduler.select_from([CandidateScore("june", 0.199, ())]) is None
+
+
+def test_select_candidate_draws_rng_like_one_scoring_pass() -> None:
+    agents = [agent("june", "June"), agent("atlas", "Atlas"), agent("sora", "Sora")]
+    config = neutral_config(random_jitter=0.15)
+    scored = Scheduler(config, rng=Random(11))
+    selected = Scheduler(config, rng=Random(11))
+
+    scored.score_agents(agents, [], 0)
+    selected.select_candidate(agents, [], 0)
+
+    assert selected.rng.getstate() == scored.rng.getstate()
 
 def test_quiet_realtime_room_yields_one_decision_tick() -> None:
     scheduler = Scheduler(neutral_config(), rng=Random(3))
@@ -188,11 +287,11 @@ def test_quiet_realtime_room_yields_one_decision_tick() -> None:
     )
     sleeps: list[float] = []
 
-    async def sleep_fn(seconds: float) -> None:
+    def sleep_fn(seconds: float) -> None:
         sleeps.append(seconds)
         monotonic[0] += seconds
 
-    asyncio.run(scheduler.wait_for_next_tick(clock, sleep_fn=sleep_fn))
+    scheduler.wait_for_next_tick(clock, sleep_fn=sleep_fn)
 
     assert sleeps == [5.0]
     assert clock.now_ms() == 5_000
@@ -204,19 +303,15 @@ def test_thousand_quiet_accelerated_ticks_advance_without_model_calls() -> None:
     june = agent("june", "June")
     model_calls = 0
 
-    async def forbidden_sleep(_seconds: float) -> None:
+    def forbidden_sleep(_seconds: float) -> None:
         raise AssertionError("accelerated time must not sleep")
 
-    async def run_quiet_room() -> None:
-        nonlocal model_calls
-        for _ in range(1_000):
-            candidate = scheduler.select_candidate([june], [], clock.now_ms())
-            if candidate is not None:
-                model_calls += 1
-            else:
-                await scheduler.wait_for_next_tick(clock, sleep_fn=forbidden_sleep)
-
-    asyncio.run(run_quiet_room())
+    for _ in range(1_000):
+        candidate = scheduler.select_candidate([june], [], clock.now_ms())
+        if candidate is not None:
+            model_calls += 1
+        else:
+            scheduler.wait_for_next_tick(clock, sleep_fn=forbidden_sleep)
 
     assert model_calls == 0
     assert clock.now_ms() == 5_000_000
