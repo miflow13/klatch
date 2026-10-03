@@ -222,3 +222,31 @@ def test_read_recent_events_can_bound_the_window_over_selected_types(tmp_path) -
     # Type names are bound parameters, never interpolated into the SQL.
     assert store.read_recent_events("run-1", 5, types=["message' OR '1'='1"]) == []
     store.close()
+
+
+def test_has_schema_detects_initialized_stores_without_creating_tables(tmp_path) -> None:
+    foreign = tmp_path / "foreign.db"
+    connection = sqlite3.connect(foreign)
+    connection.execute("CREATE TABLE notes (body TEXT)")
+    connection.commit()
+    connection.close()
+    store = EventStore(foreign)
+    try:
+        assert store.has_schema() is False
+        assert store.has_schema() is False
+    finally:
+        store.close()
+    connection = sqlite3.connect(foreign)
+    try:
+        tables = [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    finally:
+        connection.close()
+    assert tables == ["notes"]
+
+    driftroom_db = tmp_path / "driftroom.db"
+    store = EventStore(driftroom_db)
+    try:
+        store.initialize()
+        assert store.has_schema() is True
+    finally:
+        store.close()

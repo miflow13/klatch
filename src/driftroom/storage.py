@@ -158,6 +158,15 @@ class EventStore:
             self._db.rollback()
             raise
 
+    def has_schema(self) -> bool:
+        """Whether this database holds the Driftroom tables, checked without writing to it."""
+        required = ("runs", "agents", "events", "room_controls")
+        rows = self._db.execute(
+            f"SELECT name FROM sqlite_master WHERE type='table' AND name IN ({', '.join('?' for _ in required)})",
+            required,
+        ).fetchall()
+        return len(rows) == len(required)
+
     @contextmanager
     def _transaction(self) -> Iterator[None]:
         self._db.execute("BEGIN IMMEDIATE")

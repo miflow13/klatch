@@ -3,6 +3,11 @@
 Every command except ``start`` only touches SQLite through ``EventStore``; the
 model backend and engine are imported inside ``start`` so control commands never
 load them. The CLI never writes dialogue: only the engine commits events.
+
+Only ``start`` initializes a database. The other commands open it as it is and
+refuse anything without the Driftroom tables, so they never add schema to a
+foreign SQLite file. A restart takes the room and config recorded for the run
+(spec §25, §33), so the regime of a run cannot change underneath it.
 """
 
 from collections import Counter
@@ -11,15 +16,18 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from enum import Enum
 import json
+import os
 from pathlib import Path
 from random import Random
+import secrets
+import sqlite3
 import time
 from typing import Annotated, NoReturn
 
 from rich.console import Console
 import typer
 
-from .config import load_run_config
+from .config import load_run_config, run_config_hash
 from .domain import VISIBLE_EVENT_TYPES
 from .observer import format_sim_time, render_event
 from .storage import DesiredState, EventStore, RunRecord, StoredEvent
@@ -33,6 +41,11 @@ app = typer.Typer(
 DbOption = Annotated[Path, typer.Option("--db", help="SQLite database path.")]
 RunOption = Annotated[str, typer.Option("--run", help="Run ID.")]
 RoomOption = Annotated[str, typer.Option("--room", help="Room ID.")]
+
+DEFAULT_ROOM = "room-1"
+# ``start --fake`` records this digest for every model, so session_started and the run
+# fingerprint mark the session as canned test chatter rather than model output.
+FAKE_DIGEST = "fake"
 
 # Canned lines for ``start --fake``: test tooling for end-to-end checks, not product behavior.
 _FAKE_LINES = ("hey", "anyone around", "lol same", "huh", "not sure tbh", "ok fair", "wait what", "mm")
@@ -49,10 +62,22 @@ def _fail(message: str) -> NoReturn:
 
 
 def _open_store(db: Path, *, create: bool = False) -> EventStore:
+    """Open the store. Only ``create`` (used by ``start``) initializes the schema; every
+    other command opens the file as it is and refuses one without Driftroom tables."""
     if not create and not db.exists():
         _fail(f"database not found: {db}")
-    store = EventStore(db)
-    store.initialize()
+    store: EventStore | None = None
+    try:
+        store = EventStore(db)
+        if create:
+            store.initialize()
+        elif not store.has_schema():
+            store.close()
+            _fail(f"not a Driftroom database: {db}")
+    except sqlite3.DatabaseError as exc:
+        if store is not None:
+            store.close()
+        _fail(f"not a Driftroom database: {db} ({exc})")
     return store
 
 
@@ -68,6 +93,19 @@ def _all_events(store: EventStore, run_id: str) -> Iterator[StoredEvent]:
     while batch := store.read_events(run_id, after_id=last_id):
         yield from batch
         last_id = batch[-1].id
+
+
+def _recorded_digests(store: EventStore, run_id: str) -> dict[str, object] | None:
+    """Model digests from the run's first ``session_started`` event, if it has one."""
+    first = next((event for event in _all_events(store, run_id) if event.type == "session_started"), None)
+    if first is None:
+        return None
+    digests = first.payload.get("model_digests")
+    return dict(digests) if isinstance(digests, dict) else {}
+
+
+def _is_fake(digests: dict[str, object]) -> bool:
+    return bool(digests) and all(digest == FAKE_DIGEST for digest in digests.values())
 
 
 def _print_event(console: Console, event: StoredEvent, *, debug: bool) -> None:
@@ -103,49 +141,79 @@ def _fake_backend(seed: int):  # noqa: ANN202 - the class is local to keep model
 
 @app.command()
 def start(
-    config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False, help="Run config TOML.")],
     db: DbOption,
+    config: Annotated[Path | None, typer.Option(
+        "--config", exists=True, dir_okay=False,
+        help="Run config TOML. Required for a new run; a restart uses the recorded config.",
+    )] = None,
     run: Annotated[str | None, typer.Option("--run", help="Run ID (default: run-<UTC timestamp>).")] = None,
-    room: RoomOption = "room-1",
-    fake: Annotated[bool, typer.Option("--fake", help="Use canned fake decisions instead of Ollama.")] = False,
+    room: Annotated[str | None, typer.Option(
+        "--room", help=f"Room ID for a new run (default: {DEFAULT_ROOM}); a restart uses the recorded room.",
+    )] = None,
+    fake: Annotated[bool, typer.Option(
+        "--fake", hidden=True, help="Test tooling: canned fake decisions instead of Ollama.",
+    )] = False,
     max_steps: Annotated[int | None, typer.Option("--max-steps", min=1, help="Stop after N engine steps.")] = None,
     host: Annotated[str | None, typer.Option("--host", help="Ollama host URL.")] = None,
 ) -> None:
-    """Run the simulation engine in this terminal."""
+    """Run the simulation engine in this terminal (a new run, or a restart of a recorded one)."""
     from .engine import SimulationEngine
+    from .models.base import BackendError
 
-    try:
-        run_config = load_run_config(config)
-    except (OSError, ValueError) as exc:
-        _fail(f"invalid config {config}: {exc}")
+    given_config = None
+    if config is not None:
+        try:
+            given_config = load_run_config(config)
+        except (OSError, ValueError) as exc:
+            _fail(f"invalid config {config}: {exc}")
     run_id = run or f"run-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
     store = _open_store(db, create=True)
     try:
-        model_digests: dict[str, str | None] | None = None
+        record = store.get_run(run_id)
+        if record is None:
+            if given_config is None:
+                _fail(f"--config is required to start a new run ({run_id})")
+            run_config, room_id = given_config, room or DEFAULT_ROOM
+        else:
+            # A restart continues the recorded run (spec §25, §33): same room, same regime.
+            if room is not None and room != record.room_id:
+                _fail(f"run {run_id} belongs to room {record.room_id}, not {room}; omit --room to restart it")
+            if given_config is not None and run_config_hash(given_config) != run_config_hash(record.config):
+                _fail(f"{config} differs from the config recorded for run {run_id}; a restart keeps the "
+                      "recorded regime (omit --config, or start a new run)")
+            run_config, room_id = record.config, record.room_id
+            recorded = _recorded_digests(store, run_id)
+            if recorded is not None and fake and not _is_fake(recorded):
+                _fail(f"run {run_id} was recorded with real models; --fake cannot continue it")
+            if recorded is not None and not fake and _is_fake(recorded):
+                _fail(f"run {run_id} is a fake-backend test run; it can only be restarted with --fake")
+        models = sorted({agent.model for agent in run_config.agents})
         if fake:
             seed = run_config.runtime.random_seed
             backend = _fake_backend(0 if seed is None else seed)
+            model_digests: dict[str, str | None] = {model: FAKE_DIGEST for model in models}
         else:
-            from .models.base import BackendError
             from .models.ollama_backend import OllamaBackend
 
             backend = OllamaBackend(run_config.runtime, host=host)
             try:
-                model_digests = {
-                    model: backend.model_info(model).digest
-                    for model in sorted({agent.model for agent in run_config.agents})
-                }
+                model_digests = {model: backend.model_info(model).digest for model in models}
             except BackendError as exc:
                 _fail(str(exc))
         console = Console()
         typer.echo(f"run id: {run_id}")
-        typer.echo(f"room id: {room}")
-        engine = SimulationEngine(
-            run_config, store, backend, run_id=run_id, room_id=room,
-            observer=lambda event: _print_event(console, event, debug=False),
-            model_digests=model_digests,
-        )
-        engine.start()
+        typer.echo(f"room id: {room_id}")
+        try:
+            engine = SimulationEngine(
+                run_config, store, backend, run_id=run_id, room_id=room_id,
+                observer=lambda event: _print_event(console, event, debug=False),
+                model_digests=model_digests,
+            )
+            engine.start()
+        except KeyError as exc:
+            _fail(str(exc.args[0]) if exc.args else repr(exc))
+        except (ValueError, BackendError) as exc:
+            _fail(str(exc))
         try:
             engine.run(max_steps)
         except KeyboardInterrupt:
@@ -258,16 +326,27 @@ def export(
     store = _open_store(db)
     try:
         _require_run(store, run)
+        if not output.parent.is_dir():
+            _fail(f"output directory does not exist: {output.parent}")
+        # Write beside the target and swap it in at the end, so a failed export never
+        # leaves a truncated file where the previous one was.
+        partial = output.with_name(f".{output.name}.{secrets.token_hex(4)}.partial")
         written = 0
-        with output.open("w", encoding="utf-8", newline="\n") as handle:
-            for event in _all_events(store, run):
-                if export_format is ExportFormat.jsonl:
-                    handle.write(json.dumps(asdict(event), ensure_ascii=False) + "\n")
-                elif (rendered := render_event(event)) is not None:
-                    handle.write(("\n" if written else "") + rendered + "\n")
-                else:
-                    continue
-                written += 1
+        try:
+            with partial.open("x", encoding="utf-8", newline="\n") as handle:
+                for event in _all_events(store, run):
+                    if export_format is ExportFormat.jsonl:
+                        handle.write(json.dumps(asdict(event), ensure_ascii=False) + "\n")
+                    elif (rendered := render_event(event)) is not None:
+                        handle.write(("\n" if written else "") + rendered + "\n")
+                    else:
+                        continue
+                    written += 1
+            os.replace(partial, output)
+        except OSError as exc:
+            _fail(f"could not write {output}: {exc}")
+        finally:
+            partial.unlink(missing_ok=True)
         typer.echo(f"exported {written} events to {output}")
     finally:
         store.close()
