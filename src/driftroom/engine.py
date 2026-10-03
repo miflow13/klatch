@@ -16,7 +16,7 @@ from typing import Literal
 from .clock import VirtualClock
 from .config import ENGINE_VERSION, run_config_hash, run_fingerprint
 from .domain import VISIBLE_EVENT_TYPES, RunConfig
-from .models.base import BackendError, ModelBackend
+from .models.base import BackendError, Decision, DecisionValidationError, ModelBackend, raw_excerpt
 from .prompting import (
     TRAIT_RENDERER_VERSION, TURN_FORMAT_VERSION, TurnContext, build_turn_messages, prompt_template_hash,
 )
@@ -32,6 +32,16 @@ AMBIENT_SILENCE_TEXT = "the room has been quiet for a while"
 class EngineStepResult:
     kind: Literal["message", "wait", "generation_failed", "ambient", "idle", "paused", "stopped"]
     event_id: int | None
+
+
+def _check_target(decision: Decision, targets: Sequence[str]) -> None:
+    """Belt and braces for backends whose output is not grammar-constrained (§11):
+    a decision may address only another participant, or no one."""
+    if decision.target is not None and decision.target not in targets:
+        raise DecisionValidationError(
+            "target is not a participant",
+            detail=raw_excerpt(f"target {decision.target!r} is not one of {list(targets)!r}"),
+        )
 
 
 def _latest(*sim_ms: int | None) -> int | None:
@@ -172,6 +182,8 @@ class SimulationEngine:
     def _decide(self, candidate: CandidateScore, recent: Sequence[StoredEvent], now: int) -> EngineStepResult:
         agent = next(agent for agent in self.config.agents if agent.id == candidate.agent_id)
         messages = build_turn_messages(TurnContext(agent, recent, now))
+        # Who this agent may address: the other participants, by display name (§11).
+        targets = [other.name for other in self.config.agents if other.id != agent.id]
         selection = {"scheduler_score": candidate.score, "reasons": list(candidate.reasons)}
         attempts = 1 + self.config.runtime.retry_count
         for attempt in range(1, attempts + 1):
@@ -192,11 +204,13 @@ class SimulationEngine:
                     "longer describes the prompts (start a new run, or restart with --allow-regime-change)"
                 )
             try:
-                result = self.backend.decide(agent, messages)
+                result = self.backend.decide(agent, messages, targets=targets)
+                _check_target(result.decision, targets)
             except BackendError as exc:
                 last_error = exc
                 self._commit("attempt_failed", agent.id, now, {
-                    "attempt": attempt, "error_class": type(exc).__name__, "error": str(exc), **selection,
+                    "attempt": attempt, "error_class": type(exc).__name__, "error": str(exc),
+                    "raw_excerpt": exc.raw_excerpt, "detail": exc.detail, **selection,
                 })
                 continue
             metadata = {

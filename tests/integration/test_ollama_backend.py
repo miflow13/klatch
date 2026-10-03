@@ -24,15 +24,21 @@ def test_local_qwen3_returns_a_constrained_decision() -> None:
         {
             "role": "system",
             "content": (
-                "You are June in a text room. Return one JSON decision: "
-                "speak with a nonblank message, or wait with null message."
+                "You are June in a text room with Ada. Return one JSON decision: "
+                "speak with a nonblank message, or wait with null message and target."
             ),
         },
-        {"role": "user", "content": "Room history: Kai said hello."},
+        {"role": "user", "content": "Room history: Ada said hello."},
     ]
     backend = OllamaBackend(RuntimeConfig())
-    result = backend.decide(agent, messages)
-    assert result.decision.action in {"speak", "wait"}
+    result = backend.decide(agent, messages, targets=["Ada"])
+    decision = result.decision
+    if decision.action == "wait":
+        assert (decision.message, decision.target) == (None, None)
+    else:
+        assert decision.action == "speak"
+        assert decision.message is not None and decision.message.strip()
+        assert decision.target in {None, "Ada"}
     assert result.model == "qwen3:4b"
 
     digest = backend.model_info("qwen3:4b").digest

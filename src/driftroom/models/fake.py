@@ -11,10 +11,17 @@ from .base import BackendError, Decision, ModelBackend, ModelResult
 class FakeModelBackend(ModelBackend):
     def __init__(self, outcomes: Iterable[Decision | Exception]) -> None:
         self._outcomes = deque(outcomes)
+        # The targets of every call, for tests; the fake's outcomes ignore them.
+        self.targets: list[tuple[str, ...]] = []
 
     def decide(
-        self, agent: AgentConfig, messages: Sequence[dict[str, str]]
+        self,
+        agent: AgentConfig,
+        messages: Sequence[dict[str, str]],
+        *,
+        targets: Sequence[str] = (),
     ) -> ModelResult:
+        self.targets.append(tuple(targets))
         if not self._outcomes:
             raise BackendError("fake model outcomes exhausted")
         outcome = self._outcomes.popleft()

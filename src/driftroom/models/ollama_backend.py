@@ -20,6 +20,9 @@ from .base import (
     ModelInfo,
     ModelResult,
     TruncatedGenerationError,
+    decision_schema,
+    raw_excerpt,
+    validation_detail,
 )
 
 
@@ -62,7 +65,11 @@ class OllamaBackend(ModelBackend):
         )
 
     def decide(
-        self, agent: AgentConfig, messages: Sequence[dict[str, str]]
+        self,
+        agent: AgentConfig,
+        messages: Sequence[dict[str, str]],
+        *,
+        targets: Sequence[str] = (),
     ) -> ModelResult:
         started = time.monotonic()
         response = _call(
@@ -73,7 +80,8 @@ class OllamaBackend(ModelBackend):
                 # Thinking is never configurable in v0.1 (spec §16).
                 think=False,
                 stream=False,
-                format=Decision.model_json_schema(),
+                # Per agent: the grammar enforces the speak/wait contract (§11).
+                format=decision_schema(targets),
                 options={
                     "temperature": agent.sampling.temperature,
                     "top_p": agent.sampling.top_p,
@@ -85,20 +93,27 @@ class OllamaBackend(ModelBackend):
             ),
         )
 
+        content = _field(_field(response, "message"), "content")
+        excerpt = raw_excerpt(content if isinstance(content, str) else ("" if content is None else repr(content)))
+
         # A length-cut envelope is not a trustworthy decision, even if it parses.
         if _field(response, "done_reason") == "length":
             raise TruncatedGenerationError(
                 "Ollama hit the output-token limit (max_output_tokens="
-                f"{self._runtime.max_output_tokens}) before completing the decision"
+                f"{self._runtime.max_output_tokens}) before completing the decision",
+                raw_excerpt=excerpt, detail="done_reason=length",
             )
 
-        content = _field(_field(response, "message"), "content")
         if not isinstance(content, str) or not content.strip():
-            raise EmptyModelContentError("Ollama returned empty decision content")
+            raise EmptyModelContentError(
+                "Ollama returned empty decision content", raw_excerpt=excerpt, detail="empty content"
+            )
         try:
             decision = Decision.model_validate_json(content)
         except ValidationError as exc:
-            raise DecisionValidationError("Ollama decision violates schema") from exc
+            raise DecisionValidationError(
+                "Ollama decision violates schema", raw_excerpt=excerpt, detail=validation_detail(exc)
+            ) from exc
 
         total_duration = _field(response, "total_duration")
         latency_ms = (

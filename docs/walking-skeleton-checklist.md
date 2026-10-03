@@ -47,6 +47,10 @@ driftroom start --db room.sqlite3 --config driftroom.example.toml
 >   2-hour accelerated run, bounded by the wait cooldown at 2 per minute for three agents),
 >   plus one ambient line every 15 minutes. In realtime each call also waits for inference,
 >   so the wall-clock rate is lower.
+> - The constrained decision schema is per agent: SPEAK carries a non-empty message and a
+>   `target` limited to the other participants' display names (or null), WAIT carries null
+>   message and target. It is part of the recorded regime via `engine_version`
+>   (`driftroom-engine-0.1.1` introduced it).
 
 ## 1. Prerequisites
 

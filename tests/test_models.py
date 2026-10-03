@@ -1,5 +1,7 @@
 """Contracts for constrained decisions and model backend outcomes."""
 
+import json
+
 import httpx
 import ollama
 import pytest
@@ -15,6 +17,7 @@ from driftroom.models.base import (
     EmptyModelContentError,
     ModelInfo,
     TruncatedGenerationError,
+    decision_schema,
 )
 from driftroom.models.fake import FakeModelBackend
 from driftroom.models.ollama_backend import OllamaBackend
@@ -124,9 +127,162 @@ def test_unknown_action_fails_validation() -> None:
         Decision(action="leave", message=None, target=None)
 
 
+# Raw envelopes real qwen3:4b returned under the old nullable-only schema (2026-10-03).
+REAL_SAMPLES = [
+    '{"action": "wait", "message": "wait", "target": "me"}',
+    '{"action": "wait", "message": "i\'m waiting for someone to talk first. maybe we can start with a joke? \U0001f602", '
+    '"target": "nobody"}',
+    '{"action": "wait", "message": "i\'m here waiting for someone to talk to me though i\'ll be the first one to say '
+    'i don\'t know if i\'m even real lol", "target": "you"}',
+]
+
+
+def conforms(schema: dict[str, object], value: object) -> bool:
+    """A tiny structural checker for exactly the keywords decision_schema uses (no jsonschema dependency)."""
+    if "anyOf" in schema and not any(conforms(branch, value) for branch in schema["anyOf"]):
+        return False
+    kind = schema.get("type")
+    if kind == "object" and not isinstance(value, dict):
+        return False
+    if kind == "string" and not isinstance(value, str):
+        return False
+    if kind == "null" and value is not None:
+        return False
+    if "const" in schema and value != schema["const"]:
+        return False
+    if "enum" in schema and value not in schema["enum"]:
+        return False
+    if "minLength" in schema and len(value) < schema["minLength"]:
+        return False
+    properties = schema.get("properties", {})
+    if properties:
+        if any(key not in value for key in schema.get("required", [])):
+            return False
+        if schema.get("additionalProperties") is False and set(value) - set(properties):
+            return False
+        if not all(conforms(sub, value[key]) for key, sub in properties.items() if key in value):
+            return False
+    return True
+
+
+def test_decision_schema_is_a_two_branch_speak_wait_contract() -> None:
+    assert decision_schema(["June", "Ada"]) == {
+        "type": "object",
+        "anyOf": [
+            {
+                "properties": {
+                    "action": {"const": "speak"},
+                    "message": {"type": "string", "minLength": 1},
+                    "target": {"anyOf": [{"enum": ["June", "Ada"]}, {"type": "null"}]},
+                },
+                "required": ["action", "message", "target"],
+                "additionalProperties": False,
+            },
+            {
+                "properties": {
+                    "action": {"const": "wait"},
+                    "message": {"type": "null"},
+                    "target": {"type": "null"},
+                },
+                "required": ["action", "message", "target"],
+                "additionalProperties": False,
+            },
+        ],
+    }
+
+
+def test_decision_schema_without_participants_only_allows_a_null_target() -> None:
+    schema = decision_schema([])
+    assert schema["anyOf"][0]["properties"]["target"] == {"type": "null"}
+    assert schema["anyOf"][1] == decision_schema(["June"])["anyOf"][1]
+    assert decision_schema(()) == schema
+
+
+def test_decision_schema_accepts_the_contract_and_nothing_else() -> None:
+    schema = decision_schema(["June", "Ada"])
+    assert conforms(schema, {"action": "speak", "message": "hi", "target": "Ada"})
+    assert conforms(schema, {"action": "speak", "message": "hi", "target": None})
+    assert conforms(schema, {"action": "wait", "message": None, "target": None})
+    assert not conforms(schema, {"action": "speak", "message": "", "target": None})
+    assert not conforms(schema, {"action": "speak", "message": "hi", "target": "nobody"})
+    assert not conforms(schema, {"action": "wait", "message": None, "target": "Ada"})
+    assert not conforms(schema, {"action": "wait", "message": None})
+    assert not conforms(schema, {"action": "wait", "message": None, "target": None, "extra": 1})
+    assert not conforms(decision_schema([]), {"action": "speak", "message": "hi", "target": "Ada"})
+
+
+@pytest.mark.parametrize("sample", REAL_SAMPLES)
+def test_real_failing_samples_violate_both_the_model_and_the_schema(sample: str) -> None:
+    with pytest.raises(ValidationError, match="wait requires a null message"):
+        Decision.model_validate_json(sample)
+    assert not conforms(decision_schema(["June", "Ada"]), json.loads(sample))
+
+
+@pytest.mark.parametrize("sample", REAL_SAMPLES)
+def test_validation_error_carries_raw_excerpt_and_detail(sample: str) -> None:
+    client = RecordingClient(response(sample))
+    with pytest.raises(DecisionValidationError) as caught:
+        backend(client).decide(AGENT, MESSAGES, targets=["Milo", "Ada"])
+    assert caught.value.raw_excerpt == sample
+    assert caught.value.detail == "wait requires a null message"
+
+
+def test_validation_detail_names_the_field_for_field_errors() -> None:
+    client = RecordingClient(response('{"action":"speak","message":"hi","target":42}'))
+    with pytest.raises(DecisionValidationError) as caught:
+        backend(client).decide(AGENT, MESSAGES)
+    assert caught.value.detail == "target: Input should be a valid string"
+
+
+def test_validation_detail_escapes_model_chosen_keys() -> None:
+    client = RecordingClient(response('{"action":"wait","message":null,"target":null,"\\u001b[2J":1}'))
+    with pytest.raises(DecisionValidationError) as caught:
+        backend(client).decide(AGENT, MESSAGES)
+    assert caught.value.detail == "\\x1b[2J: Extra inputs are not permitted"
+
+
+def test_raw_excerpt_is_bounded_and_escaped_without_touching_the_content() -> None:
+    content = "\x1b[2J" + "x" * 400 + "\x07"
+    client = RecordingClient(response(content))
+    with pytest.raises(DecisionValidationError) as caught:
+        backend(client).decide(AGENT, MESSAGES)
+    assert caught.value.raw_excerpt == "\\x1b[2J" + "x" * 296
+    assert caught.value.detail.startswith("Invalid JSON")
+    assert "\n" not in caught.value.detail
+    assert client.response["message"]["content"] == content
+
+
+def test_truncated_and_empty_errors_carry_raw_excerpt_and_detail() -> None:
+    client = RecordingClient(response('{"action":"speak","message":"cut', done_reason="length"))
+    with pytest.raises(TruncatedGenerationError) as truncated:
+        backend(client).decide(AGENT, MESSAGES)
+    assert truncated.value.raw_excerpt == '{"action":"speak","message":"cut'
+    assert truncated.value.detail == "done_reason=length"
+
+    client = RecordingClient(response("  \n "))
+    with pytest.raises(EmptyModelContentError) as empty:
+        backend(client).decide(AGENT, MESSAGES)
+    assert empty.value.raw_excerpt == "  \n "
+    assert empty.value.detail == "empty content"
+
+
+def test_infrastructure_errors_carry_no_raw_content() -> None:
+    error = BackendTimeoutError("slow")
+    assert (error.raw_excerpt, error.detail) == (None, None)
+
+
+def test_ollama_sends_the_per_agent_schema_for_the_given_targets() -> None:
+    client = RecordingClient(response('{"action":"wait","message":null,"target":null}'))
+    backend(client).decide(AGENT, MESSAGES, targets=["Milo", "Ada"])
+    backend(client).decide(AGENT, MESSAGES)
+    assert client.calls[0]["format"] == decision_schema(["Milo", "Ada"])
+    assert client.calls[1]["format"] == decision_schema([])
+    assert len(client.calls) == 2
+
+
 def test_ollama_sends_exact_constrained_request_and_retains_metadata() -> None:
-    client = RecordingClient(response('{"action":"speak","message":"hello","target":"kai"}'))
-    result = backend(client).decide(AGENT, MESSAGES)
+    client = RecordingClient(response('{"action":"speak","message":"hello","target":"Kai"}'))
+    result = backend(client).decide(AGENT, MESSAGES, targets=["Kai"])
 
     assert client.calls == [
         {
@@ -134,7 +290,7 @@ def test_ollama_sends_exact_constrained_request_and_retains_metadata() -> None:
             "messages": MESSAGES,
             "think": False,
             "stream": False,
-            "format": Decision.model_json_schema(),
+            "format": decision_schema(["Kai"]),
             "options": {
                 "temperature": 0.67,
                 "top_p": 0.88,
@@ -146,7 +302,7 @@ def test_ollama_sends_exact_constrained_request_and_retains_metadata() -> None:
         }
     ]
     assert client.calls[0]["think"] is False
-    assert result.decision == Decision(action="speak", message="hello", target="kai")
+    assert result.decision == Decision(action="speak", message="hello", target="Kai")
     assert (result.model, result.model_digest) == ("qwen3:4b", None)
     assert (result.latency_ms, result.prompt_tokens, result.output_tokens) == (
         25.0,
@@ -360,3 +516,10 @@ def test_fake_backend_consumes_decisions_and_exceptions_in_order() -> None:
         fake.decide(AGENT, MESSAGES)
     with pytest.raises(BackendError):
         fake.decide(AGENT, MESSAGES)
+
+
+def test_fake_backend_records_the_targets_it_was_given() -> None:
+    fake = FakeModelBackend([Decision(action="wait", message=None, target=None)] * 2)
+    fake.decide(AGENT, MESSAGES, targets=["Milo", "Ada"])
+    fake.decide(AGENT, MESSAGES)
+    assert fake.targets == [("Milo", "Ada"), ()]

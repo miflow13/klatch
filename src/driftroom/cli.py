@@ -175,8 +175,8 @@ def _fake_backend(seed: int):  # noqa: ANN202 - the class is local to keep model
         def __init__(self) -> None:
             self._decisions = decisions()
 
-        def decide(self, agent, messages) -> ModelResult:  # noqa: ANN001
-            return FakeModelBackend([next(self._decisions)]).decide(agent, messages)
+        def decide(self, agent, messages, *, targets=()) -> ModelResult:  # noqa: ANN001
+            return FakeModelBackend([next(self._decisions)]).decide(agent, messages, targets=targets)
 
     return FakeChatterBackend()
 

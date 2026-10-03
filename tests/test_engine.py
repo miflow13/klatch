@@ -15,9 +15,10 @@ from driftroom.domain import AgentConfig, RunConfig
 from driftroom.engine import EngineStepResult, SimulationEngine
 from driftroom.models.base import (
     BackendTimeoutError, Decision, DecisionValidationError, EmptyModelContentError,
-    ModelBackend, ModelResult,
+    ModelBackend, ModelResult, decision_schema,
 )
 from driftroom.models.fake import FakeModelBackend
+from driftroom.models.ollama_backend import OllamaBackend
 from driftroom.prompting import TRAIT_RENDERER_VERSION, TURN_FORMAT_VERSION, prompt_template_hash
 from driftroom.storage import EventRecord, EventStore, StoredEvent
 
@@ -61,14 +62,20 @@ class RecordingBackend(ModelBackend):
         self.calls: list[tuple[AgentConfig, list[dict[str, str]]]] = []
         self.busy = False
 
-    def decide(self, agent: AgentConfig, messages: Sequence[dict[str, str]]) -> ModelResult:
+    @property
+    def targets(self) -> list[tuple[str, ...]]:
+        return self._fake.targets
+
+    def decide(
+        self, agent: AgentConfig, messages: Sequence[dict[str, str]], *, targets: Sequence[str] = (),
+    ) -> ModelResult:
         assert not self.busy, "two model calls overlapped"
         self.busy = True
         try:
             self.calls.append((agent, list(messages)))
             if self._on_call is not None:
                 self._on_call(len(self.calls))
-            return self._fake.decide(agent, messages)
+            return self._fake.decide(agent, messages, targets=targets)
         finally:
             self.busy = False
 
@@ -266,7 +273,7 @@ def test_failed_attempts_are_infrastructure_events_never_waits(tmp_path) -> None
     assert all(event.agent_id == agent_id for event in committed[1:])
     assert committed[1].payload == {
         "attempt": 1, "error_class": "BackendTimeoutError", "error": "slow",
-        "scheduler_score": 1.0, "reasons": [],
+        "raw_excerpt": None, "detail": None, "scheduler_score": 1.0, "reasons": [],
     }
     assert committed[2].payload["attempt"] == 2
     assert committed[2].payload["error_class"] == "DecisionValidationError"
@@ -275,6 +282,95 @@ def test_failed_attempts_are_infrastructure_events_never_waits(tmp_path) -> None
     assert committed[4].payload["error_class"] == "EmptyModelContentError"
     assert recovered == EngineStepResult("wait", committed[5].id)
     assert committed[5].payload["attempt"] == 2
+
+
+# Raw envelopes real qwen3:4b returned under the old nullable-only schema (2026-10-03).
+REAL_SAMPLES = [
+    '{"action": "wait", "message": "wait", "target": "me"}',
+    '{"action": "wait", "message": "i\'m waiting for someone to talk first. maybe we can start with a joke? \U0001f602", '
+    '"target": "nobody"}',
+    '{"action": "wait", "message": "i\'m here waiting for someone to talk to me though i\'ll be the first one to say '
+    'i don\'t know if i\'m even real lol", "target": "you"}',
+]
+
+
+class ScriptedOllamaClient:
+    """A fake ``ollama.Client``: replays raw chat contents and records each request."""
+
+    def __init__(self, contents: Sequence[str]) -> None:
+        self._contents = deque(contents)
+        self.calls: list[dict[str, Any]] = []
+
+    def chat(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        return {"model": "qwen3:4b", "message": {"role": "assistant", "content": self._contents.popleft()},
+                "done": True, "done_reason": "stop"}
+
+
+def test_real_failing_samples_record_raw_excerpt_and_detail_on_attempt_failed(tmp_path) -> None:
+    config = make_config(FORCED, retry_count=2)
+    client = ScriptedOllamaClient(REAL_SAMPLES)
+    engine, store, _ = make_engine(tmp_path, config, OllamaBackend(config.runtime, client=client))
+    engine.start()
+
+    failed = engine.step()
+
+    committed = events(store)
+    assert [event.type for event in committed] == [
+        "session_started", "attempt_failed", "attempt_failed", "attempt_failed", "generation_failed",
+    ]
+    for attempt, (event, sample) in enumerate(zip(committed[1:4], REAL_SAMPLES), start=1):
+        assert event.payload == {
+            "attempt": attempt, "error_class": "DecisionValidationError",
+            "error": "Ollama decision violates schema", "raw_excerpt": sample,
+            "detail": "wait requires a null message", "scheduler_score": 1.0, "reasons": [],
+        }
+    assert failed == EngineStepResult("generation_failed", committed[4].id)
+    assert [call["format"] for call in client.calls] == [decision_schema(["Milo", "Ada"])] * 3
+
+
+def test_engine_passes_the_other_participants_names_as_targets(tmp_path) -> None:
+    config = make_config(FORCED)
+    backend = RecordingBackend([WAIT])
+    engine, _, _ = make_engine(tmp_path, config, backend)
+    engine.start()
+
+    engine.step()
+
+    [(agent, _)] = backend.calls
+    assert agent.id == "june"
+    assert backend.targets == [("Milo", "Ada")]
+
+
+@pytest.mark.parametrize("decision", [
+    speak("hello?", target="nobody"), speak("talking to myself", target="June"),
+    Decision(action="wait", message=None, target="you"),
+])
+def test_a_non_participant_target_is_an_attempt_failed_never_a_message(tmp_path, decision) -> None:
+    backend = RecordingBackend([decision, WAIT])
+    engine, store, _ = make_engine(tmp_path, make_config(FORCED, retry_count=1), backend)
+    engine.start()
+
+    result = engine.step()
+
+    committed = events(store)
+    assert [event.type for event in committed] == ["session_started", "attempt_failed", "agent_wait"]
+    failed = committed[1].payload
+    assert (failed["attempt"], failed["error_class"], failed["error"]) == (
+        1, "DecisionValidationError", "target is not a participant",
+    )
+    assert failed["raw_excerpt"] is None
+    assert repr(decision.target) in failed["detail"]
+    assert result == EngineStepResult("wait", committed[2].id)
+
+
+def test_a_participant_target_is_recorded_on_the_message(tmp_path) -> None:
+    backend = RecordingBackend([speak("hi ada", target="Ada")])
+    engine, store, _ = make_engine(tmp_path, make_config(FORCED), backend)
+    engine.start()
+
+    assert engine.step().kind == "message"
+    assert events(store)[-1].payload["target"] == "Ada"
 
 
 def test_non_backend_errors_propagate_without_events(tmp_path) -> None:
@@ -700,7 +796,9 @@ class FailingAgentBackend(ModelBackend):
     def __init__(self) -> None:
         self.asked: list[str] = []
 
-    def decide(self, agent: AgentConfig, messages: Sequence[dict[str, str]]) -> ModelResult:
+    def decide(
+        self, agent: AgentConfig, messages: Sequence[dict[str, str]], *, targets: Sequence[str] = (),
+    ) -> ModelResult:
         self.asked.append(agent.id)
         if agent.id == "june":
             raise BackendTimeoutError("slow")

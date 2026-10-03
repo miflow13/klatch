@@ -237,7 +237,7 @@ def test_run_fingerprint_defaults_engine_version_constant() -> None:
         config, prompt_hash="p", model_digests=digests, engine_version=ENGINE_VERSION
     )
 
-    assert ENGINE_VERSION == "driftroom-engine-0.1.0"
+    assert ENGINE_VERSION == "driftroom-engine-0.1.1"
     assert run_fingerprint(config, prompt_hash="p", model_digests=digests) == explicit
 
 

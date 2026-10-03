@@ -31,8 +31,10 @@ class RecordingFakeBackend(FakeModelBackend):
         super().__init__(outcomes)
         self.returned: list[Decision] = []
 
-    def decide(self, agent: AgentConfig, messages: Sequence[dict[str, str]]) -> ModelResult:
-        result = super().decide(agent, messages)
+    def decide(
+        self, agent: AgentConfig, messages: Sequence[dict[str, str]], *, targets: Sequence[str] = (),
+    ) -> ModelResult:
+        result = super().decide(agent, messages, targets=targets)
         self.returned.append(result.decision)
         return result
 
