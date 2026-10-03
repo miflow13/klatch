@@ -796,6 +796,69 @@ def test_a_finished_start_releases_the_engine_lock(tmp_path: Path) -> None:
         pass
 
 
+def test_start_creates_missing_database_directories(tmp_path: Path) -> None:
+    db = tmp_path / "nested" / "deeper" / "room.sqlite3"
+    config_path = write_config(tmp_path / "r.toml")
+
+    result = runner.invoke(cli_app(), start_args(db, "run-a", "--config", str(config_path), "--fake"))
+
+    assert result.exit_code == 0, result.output
+    assert db.is_file()
+
+
+def test_start_reports_an_uncreatable_database_directory_without_a_traceback(tmp_path: Path) -> None:
+    (tmp_path / "blocker").write_text("a file, not a directory", encoding="utf-8")
+    db = tmp_path / "blocker" / "room.sqlite3"
+    config_path = write_config(tmp_path / "r.toml")
+
+    result = runner.invoke(cli_app(), start_args(db, "run-a", "--config", str(config_path), "--fake"))
+
+    assert result.exit_code == 1
+    assert f"cannot create directory {db.parent}" in result.output
+    assert isinstance(result.exception, SystemExit)
+    assert "Traceback" not in result.output
+
+
+def test_start_reports_the_control_state(tmp_path: Path) -> None:
+    db = tmp_path / "room.db"
+    config_path = write_config(tmp_path / "r.toml")
+
+    result = runner.invoke(cli_app(), start_args(db, "run-a", "--config", str(config_path), "--fake"))
+
+    assert result.exit_code == 0, result.output
+    assert re.search(r"^control: running$", result.output, flags=re.M)
+
+
+def test_start_reports_running_after_resetting_a_stale_stop_request(tmp_path: Path) -> None:
+    db = tmp_path / "room.db"
+    config_path = write_config(tmp_path / "r.toml")
+    assert runner.invoke(cli_app(), start_args(db, "run-a", "--config", str(config_path), "--fake")).exit_code == 0
+    with opened(db) as store:
+        store.set_control("room-1", "stop_requested")
+
+    result = runner.invoke(cli_app(), start_args(db, "run-a", "--fake"))
+
+    assert result.exit_code == 0, result.output
+    assert re.search(r"^control: running$", result.output, flags=re.M)
+    assert "control: stop_requested" not in result.output
+
+
+def test_start_reports_a_paused_room_and_commits_no_decision(tmp_path: Path) -> None:
+    db = tmp_path / "room.db"
+    config_path = write_config(tmp_path / "r.toml", forced=True)
+    assert runner.invoke(cli_app(), start_args(db, "run-a", "--config", str(config_path), "--fake")).exit_code == 0
+    with opened(db) as store:
+        store.set_control("room-1", "paused")
+    before = len(read_types(db, "run-a"))
+
+    result = runner.invoke(cli_app(), start_args(db, "run-a", "--fake"))
+
+    assert result.exit_code == 0, result.output
+    assert re.search(r"^control: paused$", result.output, flags=re.M)
+    new_types = read_types(db, "run-a")[before:]
+    assert not {"message", "agent_wait", "attempt_failed", "generation_failed"} & set(new_types)
+
+
 class NoDigestBackend(RealStubBackend):
     def model_info(self, model: str) -> object:
         from driftroom.models.base import ModelInfo

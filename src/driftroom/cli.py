@@ -210,6 +210,11 @@ def start(
         except (OSError, ValueError) as exc:
             _fail(f"invalid config {config}: {exc}")
     run_id = run or f"run-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    # `start` is the only command that creates a database, so it creates the directory too.
+    try:
+        db.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _fail(f"cannot create directory {db.parent}: {exc}")
     with _engine_lock(db):
         store = _open_store(db, create=True)
         try:
@@ -280,6 +285,8 @@ def start(
                 _fail(str(exc.args[0]) if exc.args else repr(exc))
             except (ValueError, BackendError) as exc:
                 _fail(str(exc))
+            # Read after engine.start(), which clears a stale stop request; a paused room stays paused.
+            typer.echo(f"control: {store.get_control(room_id).desired_state}")
             try:
                 engine.run(max_steps)
             except KeyboardInterrupt:
