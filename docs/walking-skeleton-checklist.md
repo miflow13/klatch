@@ -176,10 +176,12 @@ Copy from the run's `session_started` event(s) in the jsonl export.
 - `repeat_last_n`: 1024 (provisional; confirm with the offline probe). It is the window the
   repeat penalty looks back over (Ollama default 64 tokens covers only the NEXT ACTION text,
   so copying the previous message was never penalised). Recorded in each agent's `sampling`.
-- Repetition rule (`driftroom-engine-0.1.4`, spec §36): when the last two messages have
-  Jaccard token similarity >= `repetition_similarity_threshold` (0.6), every agent's score
-  loses `repetition_damping` (0.5) with reason `repetition`; the topic-overlap term is capped
-  (contributes nothing above that threshold).
+- Repetition rule (`driftroom-engine-0.1.4`, spec §36): when the two most recent
+  visible events (message or environment) are both messages with Jaccard token similarity
+  >= `repetition_similarity_threshold` (0.6), every agent's score loses `repetition_damping`
+  (0.5) with reason `repetition`. An environment event (ambient or startup line) as either
+  of them ends the rule, so a looping room goes quiet and recovers on the next ambient event.
+  The topic-overlap term is capped (contributes nothing above that threshold; 0 disables it).
 - `analyze_run` now reports `repeated_message_ratio` and `distinct_token_ratio`. Gate-4
   baseline (engine 0.1.3): `repeated_message_ratio` = ______ ; `distinct_token_ratio` = ______
 

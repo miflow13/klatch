@@ -256,24 +256,45 @@ def test_repeating_room_damps_every_agent_by_exactly_the_configured_amount() -> 
         assert normal[agent_id].score - damped[agent_id].score == pytest.approx(0.5)
 
 
-def test_repetition_rule_ignores_environment_events_between_and_after_messages() -> None:
+def test_an_environment_event_among_the_last_two_visible_events_ends_the_repetition_rule() -> None:
     june = agent("june", "June")
     scheduler = Scheduler(neutral_config(), rng=Random(3))
     same = "the harbor lights glow tonight"
+    echo = [message(1, 0, "ada", same), message(2, 5_000, "milo", same)]
 
-    one_message = scheduler.score_agents(
-        [june], [message(1, 0, "milo", same), environment(2, 5_000, same)], 50_000
+    plain = scheduler.score_agents([june], echo, 50_000)[0]
+    environment_last = scheduler.score_agents(
+        [june], [*echo, environment(3, 9_000, "quiet")], 50_000
     )[0]
-    across_environment = scheduler.score_agents(
+    environment_between = scheduler.score_agents(
         [june],
         [message(1, 0, "ada", same), environment(2, 5_000, "quiet"), message(3, 9_000, "milo", same)],
         50_000,
     )[0]
+    environment_previous = scheduler.score_agents(
+        [june], [environment(1, 0, same), message(2, 5_000, "milo", same)], 50_000
+    )[0]
 
-    assert one_message.score == 0
-    assert "repetition" not in one_message.reasons
-    assert "repetition" in across_environment.reasons
-    assert across_environment.score == pytest.approx(-0.5)
+    assert "repetition" in plain.reasons and plain.score == pytest.approx(-0.5)
+    for cleared in (environment_last, environment_between, environment_previous):
+        assert "repetition" not in cleared.reasons
+        assert cleared.score == 0
+
+
+def test_echo_pair_silences_the_default_room_until_an_environment_event_clears_it() -> None:
+    config = load_run_config(EXAMPLE_CONFIG)
+    scheduler = Scheduler(config.scheduler, rng=Random(1))
+    agents = config.agents
+    same = "the harbor lights glow tonight"
+    echo = [message(1, 10_000_000, "milo", same), message(2, 10_005_000, "june", same)]
+    ambient = [*echo, environment(3, 10_300_000, "A quiet minute passes in the room.")]
+
+    echoing = [scheduler.select_candidate(agents, echo, 10_360_000) for _ in range(2_000)]
+    recovered = [scheduler.select_candidate(agents, ambient, 10_360_000) for _ in range(2_000)]
+
+    assert all(c is None for c in echoing)
+    assert any(c is not None for c in recovered)
+    assert all("repetition" not in c.reasons for c in recovered if c is not None)
 
 
 def test_repetition_threshold_zero_always_damps_and_damping_zero_emits_nothing() -> None:

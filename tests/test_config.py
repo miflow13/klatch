@@ -71,6 +71,11 @@ def test_traits_are_bounded_and_runtime_has_required_defaults() -> None:
     assert runtime.retry_count == 1
 
 
+def test_repeat_last_n_accepts_the_ollama_boundary_values() -> None:
+    assert SamplingConfig(repeat_last_n=-1).repeat_last_n == -1
+    assert SamplingConfig(repeat_last_n=0).repeat_last_n == 0
+
+
 @pytest.mark.parametrize(
     "values",
     [

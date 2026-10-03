@@ -62,13 +62,17 @@ class Scheduler:
             if latest_message is not None else ""
         )
         latest_tokens = token_set(latest_text)
-        # Room-level repetition: the last two messages (environment text is skipped)
-        # say nearly the same thing, so every agent's urge to add a third drops.
+        # Room-level repetition: the two most recent visible events are both
+        # messages saying nearly the same thing, so every agent's urge to add a
+        # third drops. An environment event (ambient or startup line) as either
+        # of them ends the rule, so a looping room recovers on the next one.
         repeating = (
-            len(messages) >= 2
+            len(visible) >= 2
+            and visible[-1].type == "message"
+            and visible[-2].type == "message"
             and jaccard(
-                token_set(str(messages[-1].payload.get("message", ""))),
-                token_set(str(messages[-2].payload.get("message", ""))),
+                token_set(str(visible[-1].payload.get("message", ""))),
+                token_set(str(visible[-2].payload.get("message", ""))),
             ) >= self.config.repetition_similarity_threshold
         )
         scores = []
