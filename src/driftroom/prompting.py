@@ -10,6 +10,9 @@ from .storage import StoredEvent
 
 
 TRAIT_RENDERER_VERSION = "traits-v1"
+# No run has been recorded under this version yet, so the continuation-line indent
+# (R9) joined it without a bump. That was the last change allowed before the freeze:
+# any further change to the transcript format must bump this version.
 TURN_FORMAT_VERSION = "room-transcript-v1"
 _PROMPTS = Path(__file__).resolve().parent / "prompts"
 
@@ -62,7 +65,9 @@ def render_room_history(events: Sequence[StoredEvent], now_sim_ms: int) -> str:
     """Show committed speech and neutral environment events as a room transcript.
 
     Environment events are unattributed descriptions rendered in parentheses;
-    coarse silence cues measure gaps between any visible events.
+    coarse silence cues measure gaps between any visible events. Continuation
+    lines of a text are indented under the stamp, so text can never start a
+    transcript line and pass as another speaker; the stored text is unchanged.
     """
     lines: list[str] = []
     last_visible_ms: int | None = None
@@ -74,11 +79,13 @@ def render_room_history(events: Sequence[StoredEvent], now_sim_ms: int) -> str:
             lines.append(f"[about {minutes} minutes later]")
         minutes = event.sim_ms // 60_000
         stamp = f"[{minutes // 60:02d}:{minutes % 60:02d}]"
+        continuation = "\n" + " " * len(stamp + " ")
         if event.type == "environment":
-            lines.append(f"{stamp} ({event.payload['text']})")
+            text = continuation.join(str(event.payload["text"]).splitlines())
+            lines.append(f"{stamp} ({text})")
         else:
             speaker = str(event.payload.get("speaker") or event.agent_id or "Room")
-            message = str(event.payload["message"])
+            message = continuation.join(str(event.payload["message"]).splitlines())
             lines.append(f"{stamp} {speaker}: {message}")
         last_visible_ms = event.sim_ms
     if last_visible_ms is not None and now_sim_ms - last_visible_ms >= 300_000:

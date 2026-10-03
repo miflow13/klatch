@@ -28,13 +28,27 @@ class VirtualClock:
         self._monotonic_fn = monotonic_fn
         self._started_monotonic = monotonic_fn()
         self._sim_ms = initial_ms
+        self._paused_monotonic: float | None = None
 
     def now_ms(self) -> int:
         if self.mode == "realtime":
-            return self._sim_ms + int(
-                (self._monotonic_fn() - self._started_monotonic) * self.speed * 1_000
-            )
+            current = self._monotonic_fn() if self._paused_monotonic is None else self._paused_monotonic
+            return self._sim_ms + int((current - self._started_monotonic) * self.speed * 1_000)
         return self._sim_ms
+
+    def pause(self) -> None:
+        """Freeze a realtime clock: no wall time counts until ``resume()``.
+
+        Idempotent. An accelerated clock only moves on ``advance_ms`` and is unaffected.
+        """
+        if self.mode == "realtime" and self._paused_monotonic is None:
+            self._paused_monotonic = self._monotonic_fn()
+
+    def resume(self) -> None:
+        """Continue a paused realtime clock from where it froze. Idempotent."""
+        if self.mode == "realtime" and self._paused_monotonic is not None:
+            self._started_monotonic += self._monotonic_fn() - self._paused_monotonic
+            self._paused_monotonic = None
 
     def advance_ms(self, delta_ms: int) -> None:
         if self.mode != "accelerated":

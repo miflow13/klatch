@@ -70,11 +70,12 @@ class SimulationEngine:
         self.wall_clock = wall_clock
         self.sleep_fn = sleep_fn
         self._sim_start_ms: int | None = None
+        self._prompt_hash: str | None = None
         self._ended = False
         self._last_visible_ms: int | None = None
         self._last_ambient_ms: int | None = None
-        # Per-agent sim_ms of the last committed decision (speak or wait), fed to
-        # the scheduler's decision cooldown.
+        # Per-agent sim_ms of the last committed decision (speak, wait, or failed
+        # generation), fed to the scheduler's decision cooldown.
         self._last_decision_ms: dict[str, int] = {}
 
     def start(self) -> int:
@@ -100,7 +101,7 @@ class SimulationEngine:
         # Restore decision cooldowns so a restart does not immediately re-ask everyone.
         for event in self.store.read_recent_events(self.run_id, runtime.recent_context_events):
             self._remember_decision(event.type, event.agent_id, event.sim_ms)
-        prompt_hash = prompt_template_hash()
+        prompt_hash = self._prompt_hash = prompt_template_hash()
         self._sim_start_ms = self.clock.now_ms()
         return self._commit("session_started", None, self._sim_start_ms, {
             "run_fingerprint": run_fingerprint(
@@ -132,14 +133,16 @@ class SimulationEngine:
         # generation commit, then takes effect here before another call (§24A).
         desired = self.store.get_control(self.room_id).desired_state
         if desired == "stop_requested":
+            self.clock.resume()
             return EngineStepResult("stopped", self.stop())
         if desired == "paused":
-            # Never advance_ms: a paused accelerated room accrues no simulated time.
-            # A realtime clock follows wall time, so time spent paused still counts
-            # as simulation time there; that is deliberate for v0.1 (§13A says
-            # realtime sim time approximately follows wall time).
+            # A paused room accrues no simulated time: an accelerated clock is never
+            # advanced here and a realtime clock is frozen, so resuming fabricates no
+            # silence, ambient event or "[about N minutes later]" cue (§13A, §25).
+            self.clock.pause()
             self.sleep_fn(tick_ms / 1_000)
             return EngineStepResult("paused", None)
+        self.clock.resume()
         # The window is bounded over visible events: agent_wait, attempt_failed and
         # session_* rows must never push the transcript out of the prompt or hide
         # mention/overlap/cooldown signals from the scheduler.
@@ -178,6 +181,14 @@ class SimulationEngine:
                         "attempts": attempt - 1, "last_error_class": type(last_error).__name__,
                         "interrupted_by_control": desired,
                     }))
+            # Templates are read on every turn; an edit mid-run would change the prompts
+            # under an unchanged recorded prompt_hash (§33). Nothing is fabricated: the
+            # error propagates to the process owner like a persistence failure.
+            if prompt_template_hash() != self._prompt_hash:
+                raise RuntimeError(
+                    f"prompt templates changed during run {self.run_id}; its recorded prompt_hash no "
+                    "longer describes the prompts (start a new run, or restart with --allow-regime-change)"
+                )
             try:
                 result = self.backend.decide(agent, messages)
             except BackendError as exc:
@@ -240,7 +251,10 @@ class SimulationEngine:
         return event.id
 
     def _remember_decision(self, event_type: str, agent_id: str | None, sim_ms: int) -> None:
-        if event_type in ("agent_wait", "message") and agent_id is not None:
+        # A failed generation is not social silence and leaves social metrics alone,
+        # but for scheduling it was this agent's turn: without the cooldown a
+        # failing agent would be re-asked every tick and starve the others (§35).
+        if event_type in ("agent_wait", "message", "generation_failed") and agent_id is not None:
             self._last_decision_ms[agent_id] = sim_ms
 
     def _commit(

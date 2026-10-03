@@ -54,6 +54,11 @@ class RunMetrics:
     ambient_events: int
     mean_inference_ms: float | None
     failure_classes: dict[str, int]
+    # Messages, waits and failed generations per simulated minute between the run's
+    # first and last event: how often the room asked a model to decide.
+    decisions_per_sim_minute: float
+    wait_ratio: float
+    median_inference_ms: float | None
 
 
 def _read_all(store: EventStore, run_id: str) -> list[StoredEvent]:
@@ -64,11 +69,15 @@ def _read_all(store: EventStore, run_id: str) -> list[StoredEvent]:
 
 
 def _silence_periods(events: list[StoredEvent], threshold_ms: int) -> int:
-    """Gaps of at least ``threshold_ms`` between consecutive visible events,
-    plus the trailing gap from the last visible event to the last event of the run."""
+    """Gaps of at least ``threshold_ms`` between consecutive visible events, plus the
+    opening gap from the run's first ``session_started`` to the first visible event
+    and the trailing gap from the last visible event to the last event of the run."""
     times = [event.sim_ms for event in events if event.type in VISIBLE_EVENT_TYPES]
     if not times:
         return 0
+    started = next((event.sim_ms for event in events if event.type == "session_started"), None)
+    if started is not None and started <= times[0]:
+        times.insert(0, started)
     times.append(events[-1].sim_ms)
     return sum(1 for earlier, later in zip(times, times[1:]) if later - earlier >= threshold_ms)
 
@@ -94,9 +103,12 @@ def analyze_run(store: EventStore, run_id: str) -> RunMetrics:
         for event in events if event.type in ("message", "agent_wait")
     ]
     attempt_failures = by_type.get("attempt_failed", [])
+    waits = len(by_type.get("agent_wait", []))
+    decisions = len(messages) + waits + len(by_type.get("generation_failed", []))
+    span_ms = events[-1].sim_ms - events[0].sim_ms if events else 0
     return RunMetrics(
         visible_messages=len(messages),
-        valid_waits=len(by_type.get("agent_wait", [])),
+        valid_waits=waits,
         generation_failures=len(by_type.get("generation_failed", [])),
         attempt_failures=len(attempt_failures),
         messages_per_agent=per_agent,
@@ -108,4 +120,7 @@ def analyze_run(store: EventStore, run_id: str) -> RunMetrics:
         ambient_events=len(by_type.get("environment", [])),
         mean_inference_ms=fmean(latencies) if latencies else None,
         failure_classes=dict(Counter(str(event.payload["error_class"]) for event in attempt_failures)),
+        decisions_per_sim_minute=decisions / (span_ms / 60_000) if span_ms > 0 else 0.0,
+        wait_ratio=waits / (len(messages) + waits) if messages or waits else 0.0,
+        median_inference_ms=float(median(latencies)) if latencies else None,
     )

@@ -754,3 +754,114 @@ def test_failed_export_keeps_the_previous_output(tmp_path: Path, monkeypatch: py
     assert result.exit_code != 0
     assert output.read_text(encoding="utf-8") == "previous export\n"
     assert [path.name for path in out_dir.iterdir()] == ["run.txt"]
+
+
+# Final review fixes: one engine per database, a recorded digest, a fixed regime ---------
+
+@contextmanager
+def held_engine_lock(db: Path) -> Iterator[None]:
+    import fcntl
+
+    with open(f"{db}.engine.lock", "a+b") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def test_start_refuses_a_database_another_engine_holds(tmp_path: Path) -> None:
+    db = tmp_path / "room.db"
+    config_path = write_config(tmp_path / "r.toml")
+    first = runner.invoke(cli_app(), start_args(db, "run-a", "--config", str(config_path), "--fake"))
+    assert first.exit_code == 0, first.output
+    before = read_types(db, "run-a")
+
+    with held_engine_lock(db):
+        result = runner.invoke(cli_app(), start_args(db, "run-a", "--fake"))
+
+    assert result.exit_code == 1
+    assert f"another driftroom engine is already running on {db}" in result.output
+    assert read_types(db, "run-a") == before
+
+
+def test_a_finished_start_releases_the_engine_lock(tmp_path: Path) -> None:
+    db = tmp_path / "room.db"
+    config_path = write_config(tmp_path / "r.toml")
+
+    result = runner.invoke(cli_app(), start_args(db, "run-a", "--config", str(config_path), "--fake"))
+
+    assert result.exit_code == 0, result.output
+    with held_engine_lock(db):  # would raise BlockingIOError if start still held it
+        pass
+
+
+class NoDigestBackend(RealStubBackend):
+    def model_info(self, model: str) -> object:
+        from driftroom.models.base import ModelInfo
+        return ModelInfo(model, None)
+
+
+def test_real_start_refuses_a_model_without_a_digest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import driftroom.models.ollama_backend as ollama_backend
+
+    monkeypatch.setattr(ollama_backend, "OllamaBackend", NoDigestBackend)
+    db = tmp_path / "room.db"
+
+    result = runner.invoke(cli_app(), start_args(db, "run-real", "--config", str(write_config(tmp_path / "r.toml"))))
+
+    assert result.exit_code == 1
+    assert "qwen3:4b" in result.output and "ollama pull qwen3:4b" in result.output
+    with opened(db) as store:
+        assert store.read_events("run-real") == []
+
+
+def changed_prompt_hash(monkeypatch: pytest.MonkeyPatch) -> str:
+    import driftroom.engine
+    import driftroom.prompting
+
+    changed = "0" * 64
+    monkeypatch.setattr(driftroom.prompting, "prompt_template_hash", lambda: changed)
+    monkeypatch.setattr(driftroom.engine, "prompt_template_hash", lambda: changed)
+    return changed
+
+
+def test_restart_refuses_a_changed_regime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db = tmp_path / "room.db"
+    assert runner.invoke(cli_app(), start_args(db, "run-a", "--config", str(write_config(tmp_path / "r.toml")),
+                                               "--fake")).exit_code == 0
+    before = read_types(db, "run-a")
+    changed_prompt_hash(monkeypatch)
+
+    result = runner.invoke(cli_app(), start_args(db, "run-a", "--fake"))
+
+    assert result.exit_code == 1
+    assert "regime" in result.output and "--allow-regime-change" in result.output
+    assert "prompt" in result.output
+    assert read_types(db, "run-a") == before
+
+
+def test_allow_regime_change_restarts_under_the_new_fingerprint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from driftroom.config import run_fingerprint
+
+    db = tmp_path / "room.db"
+    assert runner.invoke(cli_app(), start_args(db, "run-a", "--config", str(write_config(tmp_path / "r.toml")),
+                                               "--fake")).exit_code == 0
+    changed = changed_prompt_hash(monkeypatch)
+
+    result = runner.invoke(cli_app(), start_args(db, "run-a", "--fake", "--allow-regime-change"))
+
+    assert result.exit_code == 0, result.output
+    with opened(db) as store:
+        sessions = [stored for stored in store.read_events("run-a") if stored.type == "session_started"]
+        recorded = store.get_run("run-a").config
+    assert len(sessions) == 2
+    expected = run_fingerprint(recorded, prompt_hash=changed, model_digests={"qwen3:4b": "fake"})
+    assert sessions[1].payload["run_fingerprint"] == expected != sessions[0].payload["run_fingerprint"]
+
+
+def test_allow_regime_change_is_documented_in_help() -> None:
+    result = runner.invoke(cli_app(), ["start", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--allow-regime-change" in result.output

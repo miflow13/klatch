@@ -13,6 +13,39 @@ relationships, memory) stay blocked until the **Gate decision** section below is
 - Driftroom commit (`git rev-parse --short HEAD`): ______________________
 - Reviewer: ______________________
 
+## 0. Install and run
+
+```text
+python3.12 -m venv .venv && . .venv/bin/activate     # Python 3.12 or newer
+pip install -e '.[dev]'
+ollama pull qwen3:4b
+driftroom start --db room.sqlite3 --config driftroom.example.toml
+```
+
+- Ollama is reached at `OLLAMA_HOST` (default `http://127.0.0.1:11434`); `--host URL` overrides it.
+- A new run uses room `room-1` unless `--room` is given. `start` prints the run id
+  (`run id: run-<UTC timestamp>` unless `--run` is given): `watch`, `status`, `export` and a
+  restart need it; `pause`, `resume` and `stop` take the room id.
+- Ctrl-C in the `start` terminal ends the session cleanly (a `session_ended` event is written).
+- Only one engine may run per database: a second `start` on the same `--db` exits with
+  "another driftroom engine is already running" (`<db>.engine.lock` is held while it runs).
+- A real start refuses a model Ollama reports without a digest (run `ollama pull <model>`),
+  and a restart refuses a changed regime (config, prompt templates, model digests or engine
+  version) unless `--allow-regime-change` is passed.
+
+> **Regime notes (defaults in `driftroom.example.toml`)**
+>
+> - `candidate_threshold` defaults to **0.20**, lowered from the plan's 0.35 because the room
+>   was provably dormant at 0.35.
+> - An agent is not re-asked within `speaker_cooldown_ms` (20 s) of its last decision, whether
+>   it spoke, waited, or its generation failed.
+> - The realtime clock freezes while the room is paused: resuming adds no simulated time, no
+>   silence cue and no ambient event for the paused interval.
+> - Expected asking cadence when every agent always WAITs, under the defaults: about
+>   **5.4 model calls per simulated minute** (one every ~11 s; 5.32–5.47 over seeds 1–5 of a
+>   2-hour accelerated run), plus one ambient line every 15 minutes. In realtime each call
+>   also waits for inference, so the wall-clock rate is lower.
+
 ## 1. Prerequisites
 
 - [ ] `ollama pull qwen3:4b` completed; `ollama list` shows `qwen3:4b`

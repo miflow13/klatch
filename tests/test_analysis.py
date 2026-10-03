@@ -117,6 +117,9 @@ def test_analyze_run_reports_every_metric_for_a_synthetic_run(store) -> None:
         ambient_events=1,
         mean_inference_ms=(100.0 + 300.0 + 200.0 + 400.0 + 500.0) / 5,
         failure_classes={"BackendTimeoutError": 2, "DecisionValidationError": 1},
+        decisions_per_sim_minute=(3 + 2 + 1) / 1.25,  # 75 s of simulated time
+        wait_ratio=2 / (3 + 2),
+        median_inference_ms=300.0,
     )
     assert set(reader.calls) == {"read_events", "get_run"}
 
@@ -132,6 +135,7 @@ def test_empty_run_has_zero_counts_and_no_inference_mean(store) -> None:
         mean_message_words=0.0, median_message_words=0.0,
         assistant_phrase_hits=0, as_an_ai_hits=0, silence_periods=0, ambient_events=0,
         mean_inference_ms=None, failure_classes={},
+        decisions_per_sim_minute=0.0, wait_ratio=0.0, median_inference_ms=None,
     )
 
 
@@ -232,3 +236,36 @@ def test_message_without_an_agent_id_is_a_value_error_not_an_assertion(store) ->
 
     with pytest.raises(ValueError, match=f"message event {event_id} has no agent"):
         analyze_run(store, "run-1")
+
+
+def test_silence_from_the_first_session_start_to_the_first_visible_event_counts(store) -> None:
+    add(store, "session_started", 0)
+    wait(store, "milo", 30_000)                        # invisible: the room is still silent
+    say(store, "june", SILENCE_MS, "a")                # opening gap == threshold: silence
+    add(store, "session_ended", SILENCE_MS, {"sim_end_ms": SILENCE_MS})
+    add(store, "session_started", SILENCE_MS, {})      # a restart's session start is not the run's start
+    say(store, "milo", 2 * SILENCE_MS - 1, "b")
+
+    assert analyze_run(store, "run-1").silence_periods == 1
+
+
+def test_opening_gap_under_threshold_is_not_silence(store) -> None:
+    add(store, "session_started", 0)
+    say(store, "june", SILENCE_MS - 1, "a")
+
+    assert analyze_run(store, "run-1").silence_periods == 0
+
+
+def test_cadence_counts_every_decision_over_the_simulated_span(store) -> None:
+    add(store, "session_started", 60_000)
+    wait(store, "june", 60_000)
+    wait(store, "milo", 90_000)
+    add(store, "generation_failed", 120_000, {"attempts": 2, "last_error_class": "BackendTimeoutError"}, "ada")
+    say(store, "june", 150_000, "hi")
+    add(store, "session_ended", 180_000, {"sim_end_ms": 180_000})
+
+    metrics = analyze_run(store, "run-1")
+
+    assert metrics.decisions_per_sim_minute == 4 / 2  # four decisions over two simulated minutes
+    assert metrics.wait_ratio == 2 / 3
+    assert metrics.median_inference_ms == 100.0

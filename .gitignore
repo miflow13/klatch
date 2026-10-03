@@ -11,3 +11,9 @@
 __pycache__/
 *.egg-info/
 build/
+
+# Driftroom run databases and engine locks
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.engine.lock

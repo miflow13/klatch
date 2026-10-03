@@ -621,3 +621,71 @@ def test_start_leaves_a_paused_room_paused(tmp_path) -> None:
 
     assert store.get_control("room-1").desired_state == "paused"
     assert engine.step() == EngineStepResult("paused", None)
+
+
+class FailingAgentBackend(ModelBackend):
+    """June's generations always fail; everyone else waits."""
+
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+
+    def decide(self, agent: AgentConfig, messages: Sequence[dict[str, str]]) -> ModelResult:
+        self.asked.append(agent.id)
+        if agent.id == "june":
+            raise BackendTimeoutError("slow")
+        return FakeModelBackend([WAIT]).decide(agent, messages)
+
+
+def test_a_failing_agent_is_not_reasked_within_the_decision_cooldown(tmp_path) -> None:
+    # Forced regime: june (first in config order) always wins unless cooling down.
+    config = make_config({**FORCED, "cooldown_penalty": 1.0}, retry_count=0)
+    backend = FailingAgentBackend()
+    engine, store, _ = make_engine(tmp_path, config, backend)
+    engine.start()
+
+    for _ in range(40):
+        engine.step()
+
+    failures = [event.sim_ms for event in events(store) if event.type == "generation_failed"]
+    assert len(failures) >= 2
+    assert min(b - a for a, b in zip(failures, failures[1:])) >= config.scheduler.speaker_cooldown_ms
+    assert {"milo", "ada"} <= set(backend.asked)
+
+
+def test_a_realtime_pause_accrues_no_simulated_time_and_fabricates_no_silence(tmp_path) -> None:
+    wall = [0.0]
+
+    def sleep(seconds: float) -> None:
+        wall[0] += seconds
+
+    config = make_config(FORCED, clock_mode="realtime")
+    clock = VirtualClock("realtime", WALL, monotonic_fn=lambda: wall[0])
+    backend = RecordingBackend([speak("hey"), WAIT])
+    engine, store, _ = make_engine(tmp_path, config, backend, clock=clock, sleep_fn=sleep)
+    engine.start()
+    assert engine.step().kind == "message"
+
+    store.set_control("room-1", "paused")
+    assert {engine.step().kind for _ in range(120)} == {"paused"}  # ten minutes of wall time
+    assert wall[0] >= 600.0
+    store.set_control("room-1", "running")
+
+    assert engine.step().kind == "wait"
+    assert [event.type for event in events(store)] == ["session_started", "message", "agent_wait"]
+    assert events(store)[-1].sim_ms == 5_000
+    assert "later]" not in history(backend.calls[-1][1])
+
+
+def test_prompt_template_edits_during_a_run_stop_the_engine_before_any_model_call(tmp_path, monkeypatch) -> None:
+    import driftroom.engine
+
+    backend = RecordingBackend([WAIT])
+    engine, store, _ = make_engine(tmp_path, make_config(FORCED), backend)
+    engine.start()
+    monkeypatch.setattr(driftroom.engine, "prompt_template_hash", lambda: "edited")
+
+    with pytest.raises(RuntimeError, match="prompt templates changed during run"):
+        engine.step()
+
+    assert backend.calls == []
+    assert types(store) == ["session_started"]

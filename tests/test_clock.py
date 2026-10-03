@@ -56,3 +56,30 @@ def test_clock_rejects_backwards_time_and_invalid_speed() -> None:
     clock = VirtualClock("accelerated", START)
     with pytest.raises(ValueError):
         clock.advance_ms(-1)
+
+
+def test_paused_realtime_clock_freezes_and_resumes_without_the_paused_time() -> None:
+    monotonic = [100.0]
+    clock = VirtualClock("realtime", START, initial_ms=1_000, monotonic_fn=lambda: monotonic[0])
+    monotonic[0] = 102.0
+    clock.pause()
+    clock.pause()  # idempotent
+    assert clock.now_ms() == 3_000
+
+    monotonic[0] += 600.0
+    assert clock.now_ms() == 3_000
+    clock.resume()
+    clock.resume()  # idempotent
+    assert clock.now_ms() == 3_000
+
+    monotonic[0] += 1.5
+    assert clock.now_ms() == 4_500
+
+
+def test_pause_and_resume_are_noops_for_an_accelerated_clock() -> None:
+    clock = VirtualClock("accelerated", START, monotonic_fn=lambda: 0.0)
+    clock.resume()
+    clock.pause()
+    clock.advance_ms(5_000)
+    clock.resume()
+    assert clock.now_ms() == 5_000

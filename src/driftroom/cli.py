@@ -12,6 +12,7 @@ foreign SQLite file. A restart takes the room and config recorded for the run
 
 from collections import Counter
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from enum import Enum
@@ -27,7 +28,7 @@ from typing import Annotated, NoReturn
 from rich.console import Console
 import typer
 
-from .config import load_run_config, run_config_hash
+from .config import ENGINE_VERSION, load_run_config, run_config_hash, run_fingerprint
 from .domain import VISIBLE_EVENT_TYPES
 from .observer import format_sim_time, render_event
 from .storage import DesiredState, EventStore, RunRecord, StoredEvent
@@ -95,9 +96,14 @@ def _all_events(store: EventStore, run_id: str) -> Iterator[StoredEvent]:
         last_id = batch[-1].id
 
 
+def _first_session(store: EventStore, run_id: str) -> StoredEvent | None:
+    """The run's first ``session_started`` event: the regime the run was recorded under."""
+    return next((event for event in _all_events(store, run_id) if event.type == "session_started"), None)
+
+
 def _recorded_digests(store: EventStore, run_id: str) -> dict[str, object] | None:
     """Model digests from the run's first ``session_started`` event, if it has one."""
-    first = next((event for event in _all_events(store, run_id) if event.type == "session_started"), None)
+    first = _first_session(store, run_id)
     if first is None:
         return None
     digests = first.payload.get("model_digests")
@@ -139,6 +145,38 @@ def _fake_backend(seed: int):  # noqa: ANN202 - the class is local to keep model
     return FakeChatterBackend()
 
 
+@contextmanager
+def _engine_lock(db: Path) -> Iterator[None]:
+    """Hold ``<db>.engine.lock`` exclusively: one engine per database (spec §17, §24A).
+
+    The lock is advisory and dies with the process, so a crashed engine never
+    leaves a stale lock behind.
+    """
+    import fcntl
+
+    lock_path = Path(f"{db}.engine.lock")
+    try:
+        handle = lock_path.open("a+b")
+    except OSError as exc:
+        _fail(f"could not open the engine lock {lock_path}: {exc}")
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _fail(f"another driftroom engine is already running on {db}")
+        yield
+    finally:
+        handle.close()  # closing the descriptor releases the lock
+
+
+def _regime_changes(first: StoredEvent, current: dict[str, object]) -> list[str]:
+    labels = {
+        "config_hash": "config", "prompt_hash": "prompt templates",
+        "model_digests": "model digests", "engine_version": "engine version",
+    }
+    return [label for key, label in labels.items() if first.payload.get(key) != current[key]]
+
+
 @app.command()
 def start(
     db: DbOption,
@@ -155,6 +193,11 @@ def start(
     )] = False,
     max_steps: Annotated[int | None, typer.Option("--max-steps", min=1, help="Stop after N engine steps.")] = None,
     host: Annotated[str | None, typer.Option("--host", help="Ollama host URL.")] = None,
+    allow_regime_change: Annotated[bool, typer.Option(
+        "--allow-regime-change",
+        help="Restart a run even though its regime (config, prompt templates, model digests, engine "
+             "version) differs from the one its first session recorded.",
+    )] = False,
 ) -> None:
     """Run the simulation engine in this terminal (a new run, or a restart of a recorded one)."""
     from .engine import SimulationEngine
@@ -167,61 +210,84 @@ def start(
         except (OSError, ValueError) as exc:
             _fail(f"invalid config {config}: {exc}")
     run_id = run or f"run-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
-    store = _open_store(db, create=True)
-    try:
-        record = store.get_run(run_id)
-        if record is None:
-            if given_config is None:
-                _fail(f"--config is required to start a new run ({run_id})")
-            run_config, room_id = given_config, room or DEFAULT_ROOM
-        else:
-            # A restart continues the recorded run (spec §25, §33): same room, same regime.
-            if room is not None and room != record.room_id:
-                _fail(f"run {run_id} belongs to room {record.room_id}, not {room}; omit --room to restart it")
-            if given_config is not None and run_config_hash(given_config) != run_config_hash(record.config):
-                _fail(f"{config} differs from the config recorded for run {run_id}; a restart keeps the "
-                      "recorded regime (omit --config, or start a new run)")
-            run_config, room_id = record.config, record.room_id
-            recorded = _recorded_digests(store, run_id)
-            if recorded is not None and fake and not _is_fake(recorded):
-                _fail(f"run {run_id} was recorded with real models; --fake cannot continue it")
-            if recorded is not None and not fake and _is_fake(recorded):
-                _fail(f"run {run_id} is a fake-backend test run; it can only be restarted with --fake")
-        models = sorted({agent.model for agent in run_config.agents})
-        if fake:
-            seed = run_config.runtime.random_seed
-            backend = _fake_backend(0 if seed is None else seed)
-            model_digests: dict[str, str | None] = {model: FAKE_DIGEST for model in models}
-        else:
-            from .models.ollama_backend import OllamaBackend
+    with _engine_lock(db):
+        store = _open_store(db, create=True)
+        try:
+            record = store.get_run(run_id)
+            if record is None:
+                if given_config is None:
+                    _fail(f"--config is required to start a new run ({run_id})")
+                run_config, room_id = given_config, room or DEFAULT_ROOM
+            else:
+                # A restart continues the recorded run (spec §25, §33): same room, same regime.
+                if room is not None and room != record.room_id:
+                    _fail(f"run {run_id} belongs to room {record.room_id}, not {room}; omit --room to restart it")
+                if given_config is not None and run_config_hash(given_config) != run_config_hash(record.config):
+                    _fail(f"{config} differs from the config recorded for run {run_id}; a restart keeps the "
+                          "recorded regime (omit --config, or start a new run)")
+                run_config, room_id = record.config, record.room_id
+                recorded = _recorded_digests(store, run_id)
+                if recorded is not None and fake and not _is_fake(recorded):
+                    _fail(f"run {run_id} was recorded with real models; --fake cannot continue it")
+                if recorded is not None and not fake and _is_fake(recorded):
+                    _fail(f"run {run_id} is a fake-backend test run; it can only be restarted with --fake")
+            models = sorted({agent.model for agent in run_config.agents})
+            if fake:
+                seed = run_config.runtime.random_seed
+                backend = _fake_backend(0 if seed is None else seed)
+                model_digests: dict[str, str | None] = {model: FAKE_DIGEST for model in models}
+            else:
+                from .models.ollama_backend import OllamaBackend
 
-            backend = OllamaBackend(run_config.runtime, host=host)
+                backend = OllamaBackend(run_config.runtime, host=host)
+                try:
+                    model_digests = {model: backend.model_info(model).digest for model in models}
+                except BackendError as exc:
+                    _fail(str(exc))
+                for model, digest in model_digests.items():
+                    if digest is None:
+                        _fail(f"Ollama reports no digest for model {model}, so this run could not record "
+                              f"exactly which model ran; install it with `ollama pull {model}`")
+            first = _first_session(store, run_id) if record is not None else None
+            if first is not None:
+                from .prompting import prompt_template_hash
+
+                # The same inputs the engine records in session_started (spec §33, §34).
+                prompt_hash = prompt_template_hash()
+                fingerprint = run_fingerprint(run_config, prompt_hash=prompt_hash, model_digests=model_digests)
+                if first.payload.get("run_fingerprint") != fingerprint and not allow_regime_change:
+                    changed = _regime_changes(first, {
+                        "config_hash": run_config_hash(run_config), "prompt_hash": prompt_hash,
+                        "model_digests": model_digests, "engine_version": ENGINE_VERSION,
+                    })
+                    _fail(f"restarting run {run_id} would change its recorded regime "
+                          f"({', '.join(changed) or 'run fingerprint'} changed since its first session). "
+                          "Everything observed in a run is read as one regime, so continuing would mix two "
+                          "experiments under one run id. Start a new run instead, or pass "
+                          "--allow-regime-change to continue this one; the new session_started then "
+                          "records the new fingerprint.")
+            console = Console()
+            typer.echo(f"run id: {run_id}")
+            typer.echo(f"room id: {room_id}")
             try:
-                model_digests = {model: backend.model_info(model).digest for model in models}
-            except BackendError as exc:
+                engine = SimulationEngine(
+                    run_config, store, backend, run_id=run_id, room_id=room_id,
+                    observer=lambda event: _print_event(console, event, debug=False),
+                    model_digests=model_digests,
+                )
+                engine.start()
+            except KeyError as exc:
+                _fail(str(exc.args[0]) if exc.args else repr(exc))
+            except (ValueError, BackendError) as exc:
                 _fail(str(exc))
-        console = Console()
-        typer.echo(f"run id: {run_id}")
-        typer.echo(f"room id: {room_id}")
-        try:
-            engine = SimulationEngine(
-                run_config, store, backend, run_id=run_id, room_id=room_id,
-                observer=lambda event: _print_event(console, event, debug=False),
-                model_digests=model_digests,
-            )
-            engine.start()
-        except KeyError as exc:
-            _fail(str(exc.args[0]) if exc.args else repr(exc))
-        except (ValueError, BackendError) as exc:
-            _fail(str(exc))
-        try:
-            engine.run(max_steps)
-        except KeyboardInterrupt:
-            pass  # run() already ended the session; stop() below is idempotent
-        engine.stop()
-        typer.echo(f"session ended: {run_id}")
-    finally:
-        store.close()
+            try:
+                engine.run(max_steps)
+            except KeyboardInterrupt:
+                pass  # run() already ended the session; stop() below is idempotent
+            engine.stop()
+            typer.echo(f"session ended: {run_id}")
+        finally:
+            store.close()
 
 
 @app.command()
