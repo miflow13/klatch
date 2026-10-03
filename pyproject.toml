@@ -7,7 +7,7 @@ name = "driftroom"
 version = "0.1.0"
 description = "A local autonomous AI chatroom simulation"
 requires-python = ">=3.12"
-dependencies = ["pydantic>=2,<3"]
+dependencies = ["pydantic>=2,<3", "ollama>=0.5,<1"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

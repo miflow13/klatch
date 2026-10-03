@@ -1,15 +1,14 @@
 """Single-call, schema-constrained inference through local Ollama."""
 
-from collections.abc import Mapping, Sequence
-import json
+from collections.abc import Callable, Mapping, Sequence
 import time
-from typing import Any
-from urllib.error import URLError
-from urllib.request import Request, urlopen
+from typing import Any, TypeVar
 
+import httpx
+import ollama
 from pydantic import ValidationError
 
-from driftroom.domain import AgentConfig
+from driftroom.domain import AgentConfig, RuntimeConfig
 
 from .base import (
     BackendError,
@@ -18,11 +17,12 @@ from .base import (
     DecisionValidationError,
     EmptyModelContentError,
     ModelBackend,
+    ModelInfo,
     ModelResult,
 )
 
 
-_LOCAL_CHAT_URL = "http://127.0.0.1:11434/api/chat"
+_T = TypeVar("_T")
 
 
 def _field(value: object, key: str) -> Any:
@@ -31,35 +31,45 @@ def _field(value: object, key: str) -> Any:
     return getattr(value, key, None)
 
 
-class _LocalOllamaClient:
-    def __init__(self, timeout_seconds: float) -> None:
-        if timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
-        self.timeout_seconds = timeout_seconds
-
-    def chat(self, **kwargs: object) -> object:
-        request = Request(
-            _LOCAL_CHAT_URL,
-            data=json.dumps(kwargs).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urlopen(request, timeout=self.timeout_seconds) as response:
-            return json.load(response)
+def _call(operation: str, request: Callable[[], _T]) -> _T:
+    """Run one client request, mapping transport failures to backend errors."""
+    try:
+        return request()
+    except (TimeoutError, httpx.TimeoutException) as exc:
+        raise BackendTimeoutError(f"Ollama {operation} timed out") from exc
+    except ollama.ResponseError as exc:
+        raise BackendError(
+            f"Ollama {operation} failed with HTTP {exc.status_code}: {exc.error}"
+        ) from exc
+    except Exception as exc:
+        raise BackendError(f"Ollama {operation} failed: {exc}") from exc
 
 
 class OllamaBackend(ModelBackend):
-    def __init__(self, client: object | None = None, *, timeout_seconds: float = 120) -> None:
-        self._client = client if client is not None else _LocalOllamaClient(timeout_seconds)
+    def __init__(
+        self,
+        runtime: RuntimeConfig,
+        *,
+        client: object | None = None,
+        host: str | None = None,
+    ) -> None:
+        self._runtime = runtime
+        self._client = (
+            client
+            if client is not None
+            else ollama.Client(host=host, timeout=runtime.inference_timeout_seconds)
+        )
 
     def decide(
         self, agent: AgentConfig, messages: Sequence[dict[str, str]]
     ) -> ModelResult:
         started = time.monotonic()
-        try:
-            response = self._client.chat(
+        response = _call(
+            "chat request",
+            lambda: self._client.chat(
                 model=agent.model,
                 messages=list(messages),
+                # Thinking is never configurable in v0.1 (spec §16).
                 think=False,
                 stream=False,
                 format=Decision.model_json_schema(),
@@ -68,16 +78,11 @@ class OllamaBackend(ModelBackend):
                     "top_p": agent.sampling.top_p,
                     "top_k": agent.sampling.top_k,
                     "repeat_penalty": agent.sampling.repeat_penalty,
+                    "num_predict": self._runtime.max_output_tokens,
+                    "num_ctx": self._runtime.max_context_tokens,
                 },
-            )
-        except TimeoutError as exc:
-            raise BackendTimeoutError("Ollama inference timed out") from exc
-        except URLError as exc:
-            if isinstance(exc.reason, TimeoutError):
-                raise BackendTimeoutError("Ollama inference timed out") from exc
-            raise BackendError("Ollama request failed") from exc
-        except Exception as exc:
-            raise BackendError("Ollama request failed") from exc
+            ),
+        )
 
         content = _field(_field(response, "message"), "content")
         if not isinstance(content, str) or not content.strip():
@@ -99,5 +104,14 @@ class OllamaBackend(ModelBackend):
             prompt_tokens=_field(response, "prompt_eval_count"),
             output_tokens=_field(response, "eval_count"),
             model=_field(response, "model") or agent.model,
-            model_digest=_field(response, "digest") or _field(response, "model_digest"),
+            # Chat responses carry no digest; the engine records it via model_info().
+            model_digest=None,
         )
+
+    def model_info(self, model: str) -> ModelInfo:
+        """Look up a locally installed model's digest by exact name."""
+        listing = _call("model list request", self._client.list)
+        for entry in _field(listing, "models") or ():
+            if model in (_field(entry, "model"), _field(entry, "name")):
+                return ModelInfo(name=model, digest=_field(entry, "digest"))
+        return ModelInfo(name=model, digest=None)

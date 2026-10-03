@@ -14,8 +14,8 @@ class Decision(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     action: Literal["speak", "wait"]
-    message: str | None = None
-    target: str | None = None
+    message: str | None
+    target: str | None
 
     @model_validator(mode="after")
     def action_matches_message(self) -> "Decision":
@@ -34,6 +34,14 @@ class ModelResult:
     output_tokens: int | None
     model: str
     model_digest: str | None = None
+
+
+@dataclass(frozen=True)
+class ModelInfo:
+    """A locally installed model and its content digest, when Ollama lists it."""
+
+    name: str
+    digest: str | None
 
 
 class BackendError(Exception):
