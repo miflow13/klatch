@@ -6,3 +6,8 @@
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+
+# Python build artifacts
+__pycache__/
+*.egg-info/
+build/
