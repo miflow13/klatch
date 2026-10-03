@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # Event types that participants can see; "environment" events are neutral,
@@ -69,11 +69,14 @@ class RuntimeConfig(StrictModel):
     clock_speed: float = Field(default=1.0, gt=0)
     max_context_tokens: int = Field(default=8192, gt=0)
 
-    @model_validator(mode="after")
-    def thinking_is_disabled_in_v0_1(self) -> "RuntimeConfig":
-        if self.model_thinking:
+    @field_validator("model_thinking")
+    @classmethod
+    def thinking_is_disabled_in_v0_1(cls, value: bool) -> bool:
+        # A field validator runs before validate_assignment commits the value,
+        # so a rejected assignment leaves the object unchanged.
+        if value:
             raise ValueError("v0.1 requires model_thinking=false")
-        return self
+        return value
 
 
 class RunConfig(StrictModel):

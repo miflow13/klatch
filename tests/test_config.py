@@ -111,6 +111,18 @@ def test_runtime_rejects_model_thinking_in_v0_1() -> None:
         RuntimeConfig(model_thinking=True)
 
 
+def test_rejected_model_thinking_assignment_leaves_value_unchanged() -> None:
+    runtime = RuntimeConfig()
+    with pytest.raises(ValidationError, match="v0.1 requires model_thinking=false"):
+        runtime.model_thinking = True
+    assert runtime.model_thinking is False
+
+    config = _fingerprint_config()
+    with pytest.raises(ValidationError, match="v0.1 requires model_thinking=false"):
+        config.runtime.model_thinking = True
+    assert config.runtime.model_thinking is False
+
+
 def test_canonical_json_is_canonically_ordered_and_hash_tracks_behavior_parameters() -> None:
     config = load_run_config(Path("driftroom.example.toml"))
     canonical = canonical_config_json(config)
@@ -219,12 +231,32 @@ def test_run_fingerprint_is_sha256_hex_and_equal_for_equal_inputs() -> None:
 
 def test_run_fingerprint_defaults_engine_version_constant() -> None:
     config = _fingerprint_config()
+    digests = {"m": None}
     explicit = run_fingerprint(
-        config, prompt_hash="p", model_digests={}, engine_version=ENGINE_VERSION
+        config, prompt_hash="p", model_digests=digests, engine_version=ENGINE_VERSION
     )
 
     assert ENGINE_VERSION == "driftroom-engine-0.1.0"
-    assert run_fingerprint(config, prompt_hash="p", model_digests={}) == explicit
+    assert run_fingerprint(config, prompt_hash="p", model_digests=digests) == explicit
+
+
+def test_run_fingerprint_requires_a_digest_entry_for_every_agent_model() -> None:
+    agents = [
+        AgentConfig(id="a", name="A", model="m"),
+        AgentConfig(id="b", name="B", model="other"),
+        AgentConfig(id="c", name="C", model="third"),
+    ]
+    config = RunConfig(agents=agents)
+
+    with pytest.raises(ValueError, match="other.*third"):
+        run_fingerprint(config, prompt_hash="p", model_digests={"m": "sha256:aaa"})
+
+    # A None digest is still a provided entry.
+    run_fingerprint(
+        config,
+        prompt_hash="p",
+        model_digests={"m": None, "other": None, "third": None},
+    )
 
 
 def _with(mutate: Callable[[RunConfig], None]) -> RunConfig:
