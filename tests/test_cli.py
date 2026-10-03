@@ -267,6 +267,86 @@ def test_start_fake_defaults_run_id_and_room(tmp_path: Path) -> None:
     assert record is not None and record.room_id == "room-1"
 
 
+class FakeTime:
+    """One fake wall clock for start: sleeping advances it, and the engine clock and heartbeat both read it."""
+
+    def __init__(self, creep: float = 0.0) -> None:
+        self.now = 1_000.0
+        self.creep = creep  # extra seconds per read, to model wall time passing without a sleep
+
+    def monotonic(self) -> float:
+        self.now += self.creep
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def fake_realtime_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, mode: str, steps: int, creep: float = 0.0,
+) -> str:
+    """Run `start --fake` under a fake clock that only advances through the engine's 5 s tick sleeps."""
+    import driftroom.engine as engine_module
+    from driftroom.clock import VirtualClock
+
+    fake = FakeTime(creep)
+    monkeypatch.setattr("driftroom.cli._SLEEP", fake.sleep)
+    monkeypatch.setattr("driftroom.cli._MONOTONIC", fake.monotonic)
+    monkeypatch.setattr(
+        engine_module, "VirtualClock",
+        lambda *args, **kwargs: VirtualClock(*args, **kwargs, monotonic_fn=fake.monotonic),
+    )
+    text = write_config(tmp_path / "run.toml").read_text(encoding="utf-8")
+    text = re.sub(r"^clock_mode = .*$", f'clock_mode = "{mode}"', text, flags=re.M)
+    # No agent ever qualifies, so every step is idle.
+    text = re.sub(r"^base_bias = .*$", "base_bias = -50.0", text, flags=re.M)
+    (tmp_path / "run.toml").write_text(text, encoding="utf-8")
+    result = runner.invoke(cli_app(), [
+        "start", "--config", str(tmp_path / "run.toml"), "--db", str(tmp_path / "room.db"),
+        "--run", "run-hb", "--fake", "--max-steps", str(steps),
+    ])
+    assert result.exit_code == 0, result.output
+    return result.output
+
+
+def test_start_prints_an_idle_heartbeat_at_most_every_thirty_seconds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 13 idle steps of 5 s: heartbeats fall due at 30 s and 60 s of wall time, not on every step.
+    output = fake_realtime_start(tmp_path, monkeypatch, mode="realtime", steps=13)
+
+    assert re.findall(r"^idle  sim (\d\d:\d\d:\d\d)$", output, flags=re.M) == ["00:00:30", "00:01:00"]
+    assert read_types(tmp_path / "room.db", "run-hb") == ["session_started", "session_ended"]
+
+
+def test_start_prints_no_heartbeat_before_thirty_seconds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert "idle  sim" not in fake_realtime_start(tmp_path, monkeypatch, mode="realtime", steps=5)
+
+
+def test_start_prints_no_heartbeat_in_accelerated_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Wall time creeps 10 s per read, so an ungated heartbeat would print on every step.
+    assert "idle  sim" not in fake_realtime_start(tmp_path, monkeypatch, mode="accelerated", steps=40, creep=10.0)
+
+
+def test_a_non_idle_step_resets_the_heartbeat_timer() -> None:
+    from driftroom.cli import _idle_heartbeat
+    from driftroom.engine import EngineStepResult
+
+    now = [0.0]
+    printed: list[str] = []
+    beat = _idle_heartbeat(lambda: 0, printed.append, every_seconds=30.0, monotonic=lambda: now[0])
+    idle, message = EngineStepResult("idle", None), EngineStepResult("message", 1)
+
+    now[0] = 29.0
+    beat(idle)
+    now[0] = 31.0
+    beat(message)  # a decision: the 30 s window starts over
+    now[0] = 60.0
+    beat(idle)
+    now[0] = 61.0
+    beat(idle)
+
+    assert printed == ["idle  sim 00:00:00"]  # only at 61 s, 30 s after the decision at 31 s
+
+
 def test_start_stops_the_engine_on_keyboard_interrupt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from driftroom.engine import SimulationEngine
 

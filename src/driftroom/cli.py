@@ -11,7 +11,7 @@ foreign SQLite file. A restart takes the room and config recorded for the run
 """
 
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -23,7 +23,7 @@ from random import Random
 import secrets
 import sqlite3
 import time
-from typing import Annotated, NoReturn
+from typing import TYPE_CHECKING, Annotated, NoReturn
 
 from rich.console import Console
 import typer
@@ -32,6 +32,9 @@ from .config import ENGINE_VERSION, load_run_config, run_config_hash, run_finger
 from .domain import VISIBLE_EVENT_TYPES
 from .observer import format_sim_time, render_event
 from .storage import DesiredState, EventStore, RunRecord, StoredEvent
+
+if TYPE_CHECKING:  # the engine is imported inside ``start`` so control commands never load it
+    from .engine import EngineStepResult
 
 
 app = typer.Typer(
@@ -121,6 +124,39 @@ def _print_event(console: Console, event: StoredEvent, *, debug: bool) -> None:
     style = None if event.type in VISIBLE_EVENT_TYPES else "dim"
     console.print(rendered, style=style, markup=False, emoji=False, highlight=False, soft_wrap=True)
     console.print()
+
+
+# Module-level so tests can substitute wall time without sleeping.
+_SLEEP = time.sleep
+_MONOTONIC = time.monotonic
+IDLE_HEARTBEAT_SECONDS = 30.0
+
+
+def _idle_heartbeat(
+    sim_ms: Callable[[], int],
+    emit: Callable[[str], None],
+    *,
+    every_seconds: float = IDLE_HEARTBEAT_SECONDS,
+    monotonic: Callable[[], float],
+) -> Callable[["EngineStepResult"], None]:
+    """An ``on_step`` callback that emits a sign of life while the engine idles.
+
+    Stdout only, never an event: a quiet room commits nothing (spec §19, §37). It fires at
+    most once per ``every_seconds`` of wall time since the last beat, the last non-idle
+    step, or its creation, so it never prints right after a decision.
+    """
+    last = monotonic()
+
+    def on_step(result: "EngineStepResult") -> None:
+        nonlocal last
+        now = monotonic()
+        if result.kind != "idle":
+            last = now
+        elif now - last >= every_seconds:
+            last = now
+            emit(f"idle  sim {format_sim_time(sim_ms(), seconds=True)}")
+
+    return on_step
 
 
 def _fake_backend(seed: int):  # noqa: ANN202 - the class is local to keep model imports out of control commands
@@ -278,7 +314,7 @@ def start(
                 engine = SimulationEngine(
                     run_config, store, backend, run_id=run_id, room_id=room_id,
                     observer=lambda event: _print_event(console, event, debug=False),
-                    model_digests=model_digests,
+                    model_digests=model_digests, sleep_fn=_SLEEP,
                 )
                 engine.start()
             except KeyError as exc:
@@ -287,8 +323,17 @@ def start(
                 _fail(str(exc))
             # Read after engine.start(), which clears a stale stop request; a paused room stays paused.
             typer.echo(f"control: {store.get_control(room_id).desired_state}")
+            # An accelerated run advances simulated time per tick with no waiting, so a
+            # heartbeat there would only spam; a realtime run idles for minutes between decisions.
+            on_step = None
+            if run_config.runtime.clock_mode == "realtime":
+                on_step = _idle_heartbeat(
+                    engine.clock.now_ms,
+                    lambda line: console.print(line, style="dim", markup=False, emoji=False, highlight=False),
+                    monotonic=_MONOTONIC,
+                )
             try:
-                engine.run(max_steps)
+                engine.run(max_steps, on_step=on_step)
             except KeyboardInterrupt:
                 pass  # run() already ended the session; stop() below is idempotent
             engine.stop()

@@ -331,6 +331,32 @@ def test_keyboard_interrupt_during_run_ends_session_and_reraises(tmp_path) -> No
     assert types(store) == ["session_started", "agent_wait", "session_ended"]
 
 
+def test_run_reports_every_step_to_on_step_including_the_final_stopped(tmp_path) -> None:
+    engine, store, _ = make_engine(tmp_path, make_config(UNREACHABLE), RecordingBackend([]))
+    engine.start()
+    seen: list[EngineStepResult] = []
+
+    def on_step(result: EngineStepResult) -> None:
+        seen.append(result)
+        if len(seen) == 3:
+            store.set_control("room-1", "stop_requested")
+
+    engine.run(on_step=on_step)
+
+    assert [result.kind for result in seen] == ["idle", "idle", "idle", "stopped"]
+    assert seen[-1].event_id == events(store)[-1].id
+
+
+def test_run_calls_on_step_once_per_step_up_to_max_steps(tmp_path) -> None:
+    engine, _, _ = make_engine(tmp_path, make_config(UNREACHABLE), RecordingBackend([]))
+    engine.start()
+    seen: list[EngineStepResult] = []
+
+    engine.run(5, on_step=seen.append)
+
+    assert [result.kind for result in seen] == ["idle"] * 5
+
+
 # --- control, time, ambient, restart -----------------------------------------
 
 def test_pause_during_inference_lets_generation_commit_then_pauses(tmp_path) -> None:

@@ -229,11 +229,19 @@ class SimulationEngine:
             last_ambient_ms is None or now - last_ambient_ms >= scheduler.ambient_min_interval_ms
         )
 
-    def run(self, max_steps: int | None = None) -> None:
+    def run(
+        self,
+        max_steps: int | None = None,
+        *,
+        on_step: Callable[[EngineStepResult], None] | None = None,
+    ) -> None:
         steps = 0
         try:
             while max_steps is None or steps < max_steps:
-                if self.step().kind == "stopped":
+                result = self.step()
+                if on_step is not None:
+                    on_step(result)
+                if result.kind == "stopped":
                     return
                 steps += 1
         except KeyboardInterrupt:
