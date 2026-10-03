@@ -9,6 +9,7 @@ import time
 from .clock import VirtualClock
 from .domain import VISIBLE_EVENT_TYPES, AgentConfig, SchedulerConfig
 from .storage import StoredEvent
+from .text import jaccard, token_set
 
 
 @dataclass(frozen=True)
@@ -60,7 +61,16 @@ class Scheduler:
             str(latest_message.payload.get("message", ""))
             if latest_message is not None else ""
         )
-        latest_tokens = set(re.findall(r"\b\w+\b", latest_text.casefold()))
+        latest_tokens = token_set(latest_text)
+        # Room-level repetition: the last two messages (environment text is skipped)
+        # say nearly the same thing, so every agent's urge to add a third drops.
+        repeating = (
+            len(messages) >= 2
+            and jaccard(
+                token_set(str(messages[-1].payload.get("message", ""))),
+                token_set(str(messages[-2].payload.get("message", ""))),
+            ) >= self.config.repetition_similarity_threshold
+        )
         scores = []
         for agent in agents:
             score = self.config.base_bias
@@ -94,12 +104,20 @@ class Scheduler:
             own_text = " ".join(
                 str(event.payload.get("message", "")) for event in own_messages[-3:]
             )
-            own_tokens = set(re.findall(r"\b\w+\b", own_text.casefold()))
+            own_tokens = token_set(own_text)
             if latest_tokens and own_tokens:
                 overlap = len(latest_tokens & own_tokens) / len(latest_tokens)
-                if overlap and self.config.topic_overlap_weight:
+                # Overlap is relevance; echoing the room (above the threshold) is not rewarded.
+                if (
+                    overlap
+                    and overlap <= self.config.repetition_similarity_threshold
+                    and self.config.topic_overlap_weight
+                ):
                     score += self.config.topic_overlap_weight * overlap
                     reasons.append("topic_overlap")
+            if repeating and self.config.repetition_damping:
+                score -= self.config.repetition_damping
+                reasons.append("repetition")
             if self.config.cooldown_penalty:
                 last_decision = (
                     last_decision_ms.get(agent.id) if last_decision_ms is not None else None

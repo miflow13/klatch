@@ -25,6 +25,7 @@ def test_configuration_defaults() -> None:
     assert SamplingConfig().top_p == 0.9
     assert SamplingConfig().top_k == 40
     assert SamplingConfig().repeat_penalty == 1.08
+    assert SamplingConfig().repeat_last_n == 1024
     assert RuntimeConfig().startup_mode == "blank"
     assert RuntimeConfig().topic is None
     assert RuntimeConfig().runtime_mode == "balanced"
@@ -77,6 +78,7 @@ def test_traits_are_bounded_and_runtime_has_required_defaults() -> None:
         {"top_p": 1.01},
         {"top_k": -1},
         {"repeat_penalty": 0},
+        {"repeat_last_n": -2},
         {"temperature": float("nan")},
         {"repeat_penalty": float("inf")},
     ],
@@ -188,7 +190,8 @@ def test_canonical_json_matches_independently_written_expected_string() -> None:
     def agent(ident: str) -> str:
         return (
             '{"id":"' + ident + '","model":"m","name":"' + ident.upper() + '",'
-            '"sampling":{"repeat_penalty":1.08,"temperature":0.8,"top_k":40,"top_p":0.9},'
+            '"sampling":{"repeat_last_n":1024,"repeat_penalty":1.08,"temperature":0.8,'
+            '"top_k":40,"top_p":0.9},'
             '"traits":{"curiosity":0.5,"formality":0.5,"humor":0.5,'
             '"impulsiveness":0.5,"reserved":0.5}}'
         )
@@ -204,6 +207,7 @@ def test_canonical_json_matches_independently_written_expected_string() -> None:
         '"candidate_threshold":0.2,"cooldown_penalty":1.0,"decision_tick_ms":5000,'
         '"direct_mention_bonus":0.55,"elapsed_weight":0.3,"random_jitter":0.15,'
         '"recent_speaker_penalty":0.45,"relationship_weight":0.1,'
+        '"repetition_damping":0.5,"repetition_similarity_threshold":0.6,'
         '"silence_ambient_after_ms":300000,"speaker_cooldown_ms":20000,'
         '"talkativeness_weight":0.45,"topic_overlap_weight":0.25,'
         '"wait_cooldown_ms":90000}}'
@@ -274,7 +278,7 @@ def test_run_fingerprint_defaults_engine_version_constant() -> None:
         config, prompt_hash="p", model_digests=digests, engine_version=ENGINE_VERSION
     )
 
-    assert ENGINE_VERSION == "driftroom-engine-0.1.3"
+    assert ENGINE_VERSION == "driftroom-engine-0.1.4"
     assert run_fingerprint(config, prompt_hash="p", model_digests=digests) == explicit
 
 

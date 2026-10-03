@@ -66,6 +66,8 @@ def test_experimental_v1_scheduler_defaults_are_recorded() -> None:
         "ambient_min_interval_ms": 900_000,
         "speaker_cooldown_ms": 20_000,
         "wait_cooldown_ms": 90_000,
+        "repetition_similarity_threshold": 0.6,
+        "repetition_damping": 0.5,
     }
 
 
@@ -227,6 +229,97 @@ def test_topic_overlap_uses_only_last_three_own_visible_messages() -> None:
 
     assert score.score == pytest.approx(0.125)
     assert no_history.score == 0
+    assert "topic_overlap" in score.reasons
+
+
+def test_repeating_room_damps_every_agent_by_exactly_the_configured_amount() -> None:
+    agents = [agent("june", "June"), agent("milo", "Milo"), agent("ada", "Ada")]
+    scheduler = Scheduler(
+        neutral_config(repetition_damping=0.5, repetition_similarity_threshold=0.6),
+        rng=Random(3),
+    )
+    echo = [
+        message(1, 0, "ada", "the harbor lights glow tonight"),
+        message(2, 5_000, "milo", "the harbor lights glow tonight friend"),
+    ]
+    fresh = [
+        message(1, 0, "ada", "completely unrelated words about breakfast"),
+        message(2, 5_000, "milo", "the harbor lights glow tonight friend"),
+    ]
+
+    damped = {s.agent_id: s for s in scheduler.score_agents(agents, echo, 50_000)}
+    normal = {s.agent_id: s for s in scheduler.score_agents(agents, fresh, 50_000)}
+
+    for agent_id in ("june", "milo", "ada"):
+        assert "repetition" in damped[agent_id].reasons
+        assert "repetition" not in normal[agent_id].reasons
+        assert normal[agent_id].score - damped[agent_id].score == pytest.approx(0.5)
+
+
+def test_repetition_rule_ignores_environment_events_between_and_after_messages() -> None:
+    june = agent("june", "June")
+    scheduler = Scheduler(neutral_config(), rng=Random(3))
+    same = "the harbor lights glow tonight"
+
+    one_message = scheduler.score_agents(
+        [june], [message(1, 0, "milo", same), environment(2, 5_000, same)], 50_000
+    )[0]
+    across_environment = scheduler.score_agents(
+        [june],
+        [message(1, 0, "ada", same), environment(2, 5_000, "quiet"), message(3, 9_000, "milo", same)],
+        50_000,
+    )[0]
+
+    assert one_message.score == 0
+    assert "repetition" not in one_message.reasons
+    assert "repetition" in across_environment.reasons
+    assert across_environment.score == pytest.approx(-0.5)
+
+
+def test_repetition_threshold_zero_always_damps_and_damping_zero_emits_nothing() -> None:
+    june = agent("june", "June")
+    events = [message(1, 0, "ada", "alpha beta"), message(2, 5_000, "milo", "gamma delta")]
+
+    always = Scheduler(neutral_config(repetition_similarity_threshold=0), rng=Random(3))
+    off = Scheduler(neutral_config(repetition_damping=0), rng=Random(3))
+    same = [message(1, 0, "ada", "alpha beta"), message(2, 5_000, "milo", "alpha beta")]
+
+    assert "repetition" in always.score_agents([june], events, 50_000)[0].reasons
+    assert "repetition" not in always.score_agents([june], events[:1], 50_000)[0].reasons
+    assert off.score_agents([june], same, 50_000)[0].reasons == ()
+
+
+def test_topic_overlap_above_the_repetition_threshold_adds_nothing() -> None:
+    june = agent("june", "June")
+    # Latest message tokens {a,b,c,d,e}; June's own last messages cover 4 of 5 = 0.8 > 0.6.
+    history = [
+        message(1, 0, "june", "alpha bravo charlie delta"),
+        message(2, 1_000, "atlas", "alpha bravo charlie delta echo"),
+    ]
+    scheduler = Scheduler(
+        neutral_config(topic_overlap_weight=0.25, repetition_damping=0), rng=Random(3)
+    )
+
+    score = scheduler.score_agents([june], history, 50_000)[0]
+
+    assert score.score == 0
+    assert "topic_overlap" not in score.reasons
+
+
+def test_topic_overlap_exactly_at_the_repetition_threshold_still_counts() -> None:
+    june = agent("june", "June")
+    # 3 of the latest message's 5 tokens are June's own: overlap 0.6 == threshold.
+    history = [
+        message(1, 0, "june", "alpha bravo charlie"),
+        message(2, 1_000, "atlas", "alpha bravo charlie delta echo"),
+    ]
+    scheduler = Scheduler(
+        neutral_config(topic_overlap_weight=0.25, repetition_damping=0), rng=Random(3)
+    )
+
+    score = scheduler.score_agents([june], history, 50_000)[0]
+
+    assert score.score == pytest.approx(0.25 * 0.6)
     assert "topic_overlap" in score.reasons
 
 

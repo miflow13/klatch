@@ -120,6 +120,8 @@ def test_analyze_run_reports_every_metric_for_a_synthetic_run(store) -> None:
         decisions_per_sim_minute=(3 + 2 + 1) / 1.25,  # 75 s of simulated time
         wait_ratio=2 / (3 + 2),
         median_inference_ms=300.0,
+        repeated_message_ratio=0.0,
+        distinct_token_ratio=1.0,  # 15 tokens over three messages, none repeated
     )
     assert set(reader.calls) == {"read_events", "get_run"}
 
@@ -136,6 +138,7 @@ def test_empty_run_has_zero_counts_and_no_inference_mean(store) -> None:
         assistant_phrase_hits=0, as_an_ai_hits=0, silence_periods=0, ambient_events=0,
         mean_inference_ms=None, failure_classes={},
         decisions_per_sim_minute=0.0, wait_ratio=0.0, median_inference_ms=None,
+        repeated_message_ratio=0.0, distinct_token_ratio=0.0,
     )
 
 
@@ -277,3 +280,65 @@ def test_cadence_counts_every_decision_over_the_simulated_span(store) -> None:
     assert metrics.decisions_per_sim_minute == 4 / 2  # four decisions over two simulated minutes
     assert metrics.wait_ratio == 2 / 3
     assert metrics.median_inference_ms == 100.0
+
+
+def test_identical_messages_are_fully_repeated_with_a_low_distinct_token_ratio(store) -> None:
+    add(store, "session_started", 0)
+    for sim_ms, speaker in ((0, "june"), (5_000, "milo"), (10_000, "ada")):
+        say(store, speaker, sim_ms, "the harbor lights glow")
+
+    metrics = analyze_run(store, "run-1")
+
+    assert metrics.repeated_message_ratio == 1.0
+    assert metrics.distinct_token_ratio == pytest.approx(4 / 12)
+
+
+def test_disjoint_messages_are_never_repeated_and_fully_distinct(store) -> None:
+    add(store, "session_started", 0)
+    say(store, "june", 0, "alpha bravo")
+    say(store, "milo", 5_000, "charlie delta")
+    say(store, "ada", 10_000, "echo foxtrot")
+
+    metrics = analyze_run(store, "run-1")
+
+    assert metrics.repeated_message_ratio == 0.0
+    assert metrics.distinct_token_ratio == 1.0
+
+
+def test_repeated_ratio_counts_messages_from_the_second_onward_at_the_threshold(store) -> None:
+    # Default threshold 0.6: "a b c" vs "a b c d e" is 3/5 = 0.6 (counts); then a miss.
+    add(store, "session_started", 0)
+    say(store, "june", 0, "alpha bravo charlie")
+    say(store, "milo", 5_000, "alpha bravo charlie delta echo")
+    add(store, "environment", 6_000, {"text": "alpha bravo charlie delta echo"})
+    say(store, "ada", 10_000, "zulu yankee")
+
+    # Two pairs from the second message onward: one repeat (the environment line is skipped).
+    assert analyze_run(store, "run-1").repeated_message_ratio == 0.5
+
+
+def test_fewer_than_two_messages_or_no_tokens_give_zero_ratios(store) -> None:
+    add(store, "session_started", 0)
+    assert analyze_run(store, "run-1").repeated_message_ratio == 0.0
+    assert analyze_run(store, "run-1").distinct_token_ratio == 0.0
+    say(store, "june", 0, "...")
+    assert analyze_run(store, "run-1").repeated_message_ratio == 0.0
+    assert analyze_run(store, "run-1").distinct_token_ratio == 0.0
+    say(store, "milo", 5_000, "...")  # two token-less messages are not a repeat either
+    metrics = analyze_run(store, "run-1")
+    assert metrics.repeated_message_ratio == 0.0
+    assert metrics.distinct_token_ratio == 0.0
+
+
+def test_repeated_ratio_uses_the_run_configs_threshold(store) -> None:
+    other = make_config()
+    other.scheduler.repetition_similarity_threshold = 1.0
+    store.create_run(RunRecord("run-strict", "room-s", WALL, other))
+    for sim_ms, text in ((0, "alpha bravo charlie"), (5_000, "alpha bravo charlie delta")):
+        add(store, "message", sim_ms, {"speaker": "June", "message": text, "target": None,
+                                       "latency_ms": 1.0}, "june", run_id="run-strict")
+        add(store, "message", sim_ms, {"speaker": "June", "message": text, "target": None,
+                                       "latency_ms": 1.0}, "june", run_id="run-1")
+
+    assert analyze_run(store, "run-strict").repeated_message_ratio == 0.0  # 0.75 < 1.0
+    assert analyze_run(store, "run-1").repeated_message_ratio == 1.0  # 0.75 >= 0.6

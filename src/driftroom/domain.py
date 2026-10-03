@@ -32,6 +32,9 @@ class SamplingConfig(StrictModel):
     top_p: float = Field(default=0.9, ge=0, le=1)
     top_k: int = Field(default=40, ge=0)
     repeat_penalty: float = Field(default=1.08, gt=0)
+    # Window the repeat penalty looks back over (Ollama: 0 disables, -1 = num_ctx).
+    # Provisional default; large enough to cover the room history in the prompt.
+    repeat_last_n: int = Field(default=1024, ge=-1)
 
 
 class AgentTraits(StrictModel):
@@ -66,6 +69,8 @@ class SchedulerConfig(StrictModel):
     ambient_min_interval_ms: int = Field(default=900_000, gt=0)
     speaker_cooldown_ms: int = Field(default=20_000, ge=0)
     wait_cooldown_ms: int = Field(default=90_000, ge=0)
+    repetition_similarity_threshold: float = Field(default=0.6, ge=0, le=1)
+    repetition_damping: float = Field(default=0.5, ge=0)
 
 
 class RuntimeConfig(StrictModel):

@@ -94,6 +94,7 @@ class OllamaBackend(ModelBackend):
                     "top_p": agent.sampling.top_p,
                     "top_k": agent.sampling.top_k,
                     "repeat_penalty": agent.sampling.repeat_penalty,
+                    "repeat_last_n": agent.sampling.repeat_last_n,
                     "num_predict": self._runtime.max_output_tokens,
                     "num_ctx": self._runtime.max_context_tokens,
                 },

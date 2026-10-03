@@ -13,6 +13,7 @@ from statistics import fmean, median
 
 from .domain import VISIBLE_EVENT_TYPES, is_ambient_event
 from .storage import EventStore, StoredEvent
+from .text import jaccard, token_set, tokens
 
 
 PAGE_SIZE = 1_000
@@ -59,6 +60,11 @@ class RunMetrics:
     decisions_per_sim_minute: float
     wait_ratio: float
     median_inference_ms: float | None
+    # Convergence: share of messages (from the second) whose Jaccard similarity to the
+    # previous message reaches the run's scheduler.repetition_similarity_threshold, and
+    # distinct tokens over all tokens across messages. Observer-only (spec §36).
+    repeated_message_ratio: float
+    distinct_token_ratio: float
 
 
 def _read_all(store: EventStore, run_id: str) -> list[StoredEvent]:
@@ -93,6 +99,13 @@ def analyze_run(store: EventStore, run_id: str) -> RunMetrics:
     messages = by_type.get("message", [])
     texts = [str(event.payload["message"]) for event in messages]
     words = [len(text.split()) for text in texts]
+    token_sets = [token_set(text) for text in texts]
+    threshold = run.config.scheduler.repetition_similarity_threshold
+    repeats = sum(
+        1 for previous, current in zip(token_sets, token_sets[1:])
+        if jaccard(current, previous) >= threshold
+    )
+    token_total = sum(len(tokens(text)) for text in texts)
     per_agent = {agent.id: 0 for agent in run.config.agents}
     for event in messages:
         if event.agent_id is None:
@@ -127,4 +140,8 @@ def analyze_run(store: EventStore, run_id: str) -> RunMetrics:
         decisions_per_sim_minute=decisions / (span_ms / 60_000) if span_ms > 0 else 0.0,
         wait_ratio=waits / (len(messages) + waits) if messages or waits else 0.0,
         median_inference_ms=float(median(latencies)) if latencies else None,
+        repeated_message_ratio=repeats / (len(texts) - 1) if len(texts) > 1 else 0.0,
+        distinct_token_ratio=(
+            len(set().union(*token_sets)) / token_total if token_total else 0.0
+        ),
     )

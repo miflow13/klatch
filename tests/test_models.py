@@ -30,7 +30,8 @@ AGENT = AgentConfig(
     name="June",
     model="qwen3:4b",
     sampling=SamplingConfig(
-        temperature=0.67, top_p=0.88, top_k=27, repeat_penalty=1.12
+        temperature=0.67, top_p=0.88, top_k=27, repeat_penalty=1.12,
+        repeat_last_n=512,
     ),
 )
 MESSAGES = [{"role": "system", "content": "You are June."}]
@@ -307,6 +308,7 @@ def test_ollama_sends_exact_constrained_request_and_retains_metadata() -> None:
                 "top_p": 0.88,
                 "top_k": 27,
                 "repeat_penalty": 1.12,
+                "repeat_last_n": 512,
                 "num_predict": 300,
                 "num_ctx": 4096,
             },

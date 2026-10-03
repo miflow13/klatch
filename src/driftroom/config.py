@@ -15,7 +15,7 @@ from .domain import (
     SchedulerConfig,
 )
 
-ENGINE_VERSION = "driftroom-engine-0.1.3"
+ENGINE_VERSION = "driftroom-engine-0.1.4"
 # Placeholder regime for memory. The memory task must replace this with real memory
 # parameters so runs with and without memory cannot hash the same.
 MEMORY_REGIME = "disabled"

@@ -173,6 +173,16 @@ Copy from the run's `session_started` event(s) in the jsonl export.
 - `trait_renderer_version`: ______________________
 - `config_hash`: ______________________
 
+- `repeat_last_n`: 1024 (provisional; confirm with the offline probe). It is the window the
+  repeat penalty looks back over (Ollama default 64 tokens covers only the NEXT ACTION text,
+  so copying the previous message was never penalised). Recorded in each agent's `sampling`.
+- Repetition rule (`driftroom-engine-0.1.4`, spec §36): when the last two messages have
+  Jaccard token similarity >= `repetition_similarity_threshold` (0.6), every agent's score
+  loses `repetition_damping` (0.5) with reason `repetition`; the topic-overlap term is capped
+  (contributes nothing above that threshold).
+- `analyze_run` now reports `repeated_message_ratio` and `distinct_token_ratio`. Gate-4
+  baseline (engine 0.1.3): `repeated_message_ratio` = ______ ; `distinct_token_ratio` = ______
+
 Note: the `room-transcript-v2` turn format is frozen from the first accepted gate run. Any
 later change to how the room transcript is rendered must bump `TURN_FORMAT_VERSION`.
 
@@ -182,5 +192,10 @@ later change to how the room transcript is rendered must bump `TURN_FORMAT_VERSI
 - [ ] **Recalibrate first** — prompt/sampling/scheduler changes needed, then rerun this checklist
 
 Reason: ______________________
+
+Per-run decisions:
+
+- gate-4 (engine 0.1.3): recalibrate first — copy-the-last-message loop from minute 13; R17
+  applied; gate-5 pending
 
 Date: ________ — Signed: ________
