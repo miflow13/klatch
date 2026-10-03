@@ -200,3 +200,25 @@ def test_read_recent_events_returns_last_n_in_ascending_order(tmp_path) -> None:
     with pytest.raises(ValueError):
         store.read_recent_events("run-1", -1)
     store.close()
+
+
+def test_read_recent_events_can_bound_the_window_over_selected_types(tmp_path) -> None:
+    store = EventStore(tmp_path / "room.sqlite3")
+    store.initialize()
+    store.create_run(run_record())
+    first = store.append_event(message(100))
+    for sim_ms in (200, 300, 400):
+        store.append_event(replace(message(sim_ms), type="agent_wait", payload={}))
+    environment = store.append_event(
+        replace(message(500), type="environment", agent_id=None, payload={"text": "quiet"})
+    )
+    store.append_event(replace(message(600), type="attempt_failed", payload={}))
+
+    visible = store.read_recent_events("run-1", 2, types={"message", "environment"})
+    assert [event.id for event in visible] == [first, environment]
+    assert [event.id for event in store.read_recent_events("run-1", 1, types=["message"])] == [first]
+    assert [event.type for event in store.read_recent_events("run-1", 2)] == ["environment", "attempt_failed"]
+    assert store.read_recent_events("run-1", 5, types=()) == []
+    # Type names are bound parameters, never interpolated into the SQL.
+    assert store.read_recent_events("run-1", 5, types=["message' OR '1'='1"]) == []
+    store.close()

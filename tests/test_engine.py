@@ -147,6 +147,21 @@ def test_start_records_full_regime_and_stop_is_idempotent(tmp_path) -> None:
     assert types(store) == ["session_started", "session_ended"]
 
 
+def test_stop_stays_idempotent_when_the_observer_raises(tmp_path) -> None:
+    def observer(event: StoredEvent) -> None:
+        if event.type == "session_ended":
+            raise RuntimeError("observer broke")
+
+    engine, store, _ = make_engine(tmp_path, make_config(), RecordingBackend([]), observer=observer)
+    engine.start()
+
+    with pytest.raises(RuntimeError, match="observer broke"):
+        engine.stop()
+    assert engine.stop() is None
+    assert engine.step() == EngineStepResult("stopped", None)
+    assert types(store) == ["session_started", "session_ended"]
+
+
 def test_supplied_model_digests_enter_the_fingerprint(tmp_path) -> None:
     config = make_config()
     digests = {"qwen3:4b": "sha256:abc"}
@@ -269,6 +284,21 @@ def test_prompt_context_is_bounded_to_recent_events(tmp_path) -> None:
     assert not any(f"line {index}" in transcript for index in range(3))
 
 
+def test_invisible_events_never_push_room_history_out_of_the_context_window(tmp_path) -> None:
+    # A quiet room fills up with agent_wait events; the window is bounded over
+    # visible events, so the transcript and scheduler signals survive.
+    backend = RecordingBackend([speak("hey")] + [WAIT] * 25)
+    engine, store, _ = make_engine(tmp_path, make_config(FORCED), backend)
+    engine.start()
+
+    kinds = [engine.step().kind for _ in range(26)]
+
+    assert kinds == ["message"] + ["wait"] * 25
+    assert types(store).count("agent_wait") == 25 > make_config().runtime.recent_context_events
+    speaker = backend.calls[0][0]
+    assert f"{speaker.name}: hey" in history(backend.calls[25][1])
+
+
 def test_keyboard_interrupt_during_run_ends_session_and_reraises(tmp_path) -> None:
     def interrupt(call: int) -> None:
         if call == 2:
@@ -319,6 +349,34 @@ def test_pause_during_inference_lets_generation_commit_then_pauses(tmp_path) -> 
     assert len(backend.calls) == 2 and types(store).count("session_ended") == 1
 
 
+@pytest.mark.parametrize(("control", "next_kind"), [("paused", "paused"), ("stop_requested", "stopped")])
+def test_control_change_during_a_failed_attempt_stops_the_retries(tmp_path, control, next_kind) -> None:
+    controller = EventStore(tmp_path / "room.sqlite3")
+
+    def pause_on_first_call(call: int) -> None:
+        if call == 1:
+            controller.set_control("room-1", control)
+
+    sleeps: list[float] = []
+    backend = RecordingBackend([BackendTimeoutError("slow"), WAIT, WAIT], on_call=pause_on_first_call)
+    engine, store, _ = make_engine(
+        tmp_path, make_config(FORCED, retry_count=2), backend, sleep_fn=sleeps.append,
+    )
+    engine.start()
+
+    failed = engine.step()
+
+    committed = events(store)
+    assert [event.type for event in committed] == ["session_started", "attempt_failed", "generation_failed"]
+    assert len(backend.calls) == 1
+    assert committed[2].payload == {
+        "attempts": 1, "last_error_class": "BackendTimeoutError", "interrupted_by_control": control,
+    }
+    assert failed == EngineStepResult("generation_failed", committed[2].id)
+    assert engine.step().kind == next_kind
+    assert len(backend.calls) == 1
+
+
 def test_ambient_silence_event_is_neutral_throttled_and_never_calls_model(tmp_path) -> None:
     config = make_config({
         **UNREACHABLE, "decision_tick_ms": 1_000, "silence_ambient_after_ms": 5_000,
@@ -341,12 +399,15 @@ def test_ambient_silence_event_is_neutral_throttled_and_never_calls_model(tmp_pa
 
 
 def test_ambient_interval_holds_when_waits_crowd_the_context_window(tmp_path) -> None:
-    # Root-cause regression: non-visible agent_wait events can push the last
+    # Root-cause regression: non-visible agent_wait events must not push the last
     # ambient event out of the bounded window; the interval must still hold.
     elapsed = [0.0]
 
     def one_second_per_call(call: int) -> None:
         elapsed[0] += 1.0
+
+    def realtime_sleep(seconds: float) -> None:
+        elapsed[0] += seconds
 
     config = make_config(
         {**FORCED, "silence_ambient_after_ms": 5_000, "ambient_min_interval_ms": 12_000},
@@ -354,14 +415,16 @@ def test_ambient_interval_holds_when_waits_crowd_the_context_window(tmp_path) ->
     )
     clock = VirtualClock("realtime", WALL, monotonic_fn=lambda: elapsed[0])
     backend = RecordingBackend([WAIT] * 30, on_call=one_second_per_call)
-    engine, store, _ = make_engine(tmp_path, config, backend, clock=clock)
+    engine, store, _ = make_engine(tmp_path, config, backend, clock=clock, sleep_fn=realtime_sleep)
     engine.start()
 
     for _ in range(25):
         engine.step()
 
+    # Each decision takes 1 s of inference plus one 5 s tick: ambient every 12 s.
     ambient_ms = [event.sim_ms for event in events(store) if event.type == "environment"]
-    assert ambient_ms == [5_000, 17_000]
+    assert ambient_ms == [6_000 + 12_000 * k for k in range(8)]
+    assert types(store).count("agent_wait") == 17
 
 
 def test_quiet_room_burn_never_spins_or_fabricates_speech(tmp_path) -> None:
@@ -376,7 +439,9 @@ def test_quiet_room_burn_never_spins_or_fabricates_speech(tmp_path) -> None:
         before = clock.now_ms()
         kind = engine.step().kind
         kinds.append(kind)
-        assert clock.now_ms() - before == (tick if kind == "idle" else 0)
+        # Every step that reaches the scheduler consumes one decision tick, so
+        # decision pacing follows simulated time, not inference latency (§13A).
+        assert clock.now_ms() - before == (0 if kind == "ambient" else tick)
 
     assert set(kinds) == {"wait", "idle", "ambient"}
     assert len(backend.calls) == kinds.count("wait") == types(store).count("agent_wait")
@@ -384,7 +449,85 @@ def test_quiet_room_burn_never_spins_or_fabricates_speech(tmp_path) -> None:
     ambient_ms = [event.sim_ms for event in events(store) if event.type == "environment"]
     assert len(ambient_ms) == kinds.count("ambient") >= 2
     assert all(later - earlier >= 120_000 for earlier, later in zip(ambient_ms, ambient_ms[1:]))
-    assert clock.now_ms() == kinds.count("idle") * tick > 0
+    assert clock.now_ms() == (len(kinds) - kinds.count("ambient")) * tick > 0
+
+
+def test_every_decision_consumes_one_tick_of_simulated_time(tmp_path) -> None:
+    config = make_config({**FORCED, "decision_tick_ms": 2_000}, retry_count=0)
+    backend = RecordingBackend([speak("hi"), WAIT, BackendTimeoutError("slow")])
+    engine, store, clock = make_engine(tmp_path, config, backend)  # sleep_fn raises
+    engine.start()
+
+    advanced = []
+    for _ in range(3):
+        before = clock.now_ms()
+        kind = engine.step().kind
+        advanced.append((kind, clock.now_ms() - before))
+
+    assert advanced == [("message", 2_000), ("wait", 2_000), ("generation_failed", 2_000)]
+    # The decision is stamped with the time it was made, before the tick.
+    assert [event.sim_ms for event in events(store)[1:]] == [0, 2_000, 4_000, 4_000]
+
+
+def test_realtime_decisions_wait_one_tick_without_touching_the_clock(tmp_path) -> None:
+    sleeps: list[float] = []
+    config = make_config({**FORCED, "decision_tick_ms": 2_000}, clock_mode="realtime")
+    clock = VirtualClock("realtime", WALL, monotonic_fn=lambda: 0.0)
+    engine, _, _ = make_engine(
+        tmp_path, config, RecordingBackend([WAIT, speak("hi")]), clock=clock, sleep_fn=sleeps.append,
+    )
+    engine.start()
+
+    assert [engine.step().kind for _ in range(2)] == ["wait", "message"]
+    assert sleeps == [2.0, 2.0]
+
+
+def decision_gaps(store: EventStore) -> list[int]:
+    last: dict[str, int] = {}
+    gaps = []
+    for event in events(store):
+        if event.type in ("agent_wait", "message"):
+            if event.agent_id in last:
+                gaps.append(event.sim_ms - last[event.agent_id])
+            last[event.agent_id] = event.sim_ms
+    return gaps
+
+
+def test_agents_are_not_reasked_within_the_cooldown_of_their_last_decision(tmp_path) -> None:
+    config = make_config()
+    backend = RecordingBackend([WAIT] * 200)
+    engine, store, _ = make_engine(tmp_path, config, backend)
+    engine.start()
+
+    kinds = [engine.step().kind for _ in range(200)]
+
+    assert kinds.count("wait") == len(backend.calls) >= 20
+    assert len({agent.id for agent, _ in backend.calls}) == 3
+    gaps = decision_gaps(store)
+    assert gaps and min(gaps) >= config.scheduler.speaker_cooldown_ms
+
+
+def test_restart_restores_decision_cooldowns_from_persisted_events(tmp_path) -> None:
+    # Forced regime: every agent scores 1.0 unless cooling down (score 0, below
+    # threshold), so selection runs june, milo, ada, idle, june, ... in config order.
+    config = make_config({**FORCED, "cooldown_penalty": 1.0})
+    store = EventStore(tmp_path / "room.sqlite3")
+    store.initialize()
+    asked: list[str] = []
+    for _ in range(3):
+        backend = RecordingBackend([WAIT] * 2)
+        engine = SimulationEngine(
+            config, store, backend, run_id="run-1", room_id="room-1",
+            wall_clock=lambda: WALL, sleep_fn=forbidden_sleep,
+        )
+        engine.start()
+        engine.run(max_steps=2)
+        engine.stop()
+        asked += [agent.id for agent, _ in backend.calls]
+
+    # Without restored cooldowns the second session would re-ask june at 10 s.
+    assert asked == ["june", "milo", "ada", "june", "milo"]
+    assert min(decision_gaps(store)) >= config.scheduler.speaker_cooldown_ms
 
 
 def test_restart_resumes_from_last_persisted_time_without_offline_events(tmp_path) -> None:
@@ -422,3 +565,40 @@ def test_restart_resumes_from_last_persisted_time_without_offline_events(tmp_pat
     assert second.step().kind == "idle"
     second.stop()
     assert events(reopened)[-1].payload == {"sim_end_ms": 25_000}
+
+
+def restart_after_control(tmp_path: Path, control: str) -> tuple[SimulationEngine, EventStore]:
+    config = make_config(UNREACHABLE)
+    store = EventStore(tmp_path / "room.sqlite3")
+    store.initialize()
+    controller = EventStore(tmp_path / "room.sqlite3")
+    first = SimulationEngine(
+        config, store, RecordingBackend([]), run_id="run-1", room_id="room-1",
+        wall_clock=lambda: WALL, sleep_fn=lambda seconds: None,
+    )
+    first.start()
+    assert first.step().kind == "idle"
+    controller.set_control("room-1", control)
+    if control == "stop_requested":
+        assert first.step().kind == "stopped"  # the room was stopped through the control table
+    second = SimulationEngine(
+        config, store, RecordingBackend([]), run_id="run-1", room_id="room-1",
+        wall_clock=lambda: WALL, sleep_fn=lambda seconds: None,
+    )
+    second.start()
+    return second, store
+
+
+def test_start_clears_a_stale_stop_request(tmp_path) -> None:
+    engine, store = restart_after_control(tmp_path, "stop_requested")
+
+    assert store.get_control("room-1").desired_state == "running"
+    assert engine.step().kind == "idle"
+    assert types(store).count("session_ended") == 1
+
+
+def test_start_leaves_a_paused_room_paused(tmp_path) -> None:
+    engine, store = restart_after_control(tmp_path, "paused")
+
+    assert store.get_control("room-1").desired_state == "paused"
+    assert engine.step() == EngineStepResult("paused", None)

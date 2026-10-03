@@ -1,6 +1,6 @@
 """SQLite event history and the small cross-process control plane."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 import json
@@ -240,13 +240,25 @@ class EventStore:
         ).fetchall()
         return [_stored_event(row) for row in rows]
 
-    def read_recent_events(self, run_id: str, limit: int) -> list[StoredEvent]:
-        """Return the last ``limit`` events of a run, oldest first."""
+    def read_recent_events(
+        self, run_id: str, limit: int, *, types: Collection[str] | None = None
+    ) -> list[StoredEvent]:
+        """Return the last ``limit`` events of a run, oldest first.
+
+        With ``types``, the window counts only events of those types, so
+        invisible bookkeeping cannot push visible history out of it.
+        """
         if limit < 0:
             raise ValueError("limit cannot be negative")
+        type_filter, type_params = "", ()
+        if types is not None:
+            type_params = tuple(sorted(set(types)))
+            if not type_params:
+                return []
+            type_filter = f" AND type IN ({', '.join('?' for _ in type_params)})"
         rows = self._db.execute(
-            "SELECT * FROM events WHERE run_id=? ORDER BY id DESC LIMIT ?",
-            (run_id, limit),
+            f"SELECT * FROM events WHERE run_id=?{type_filter} ORDER BY id DESC LIMIT ?",
+            (run_id, *type_params, limit),
         ).fetchall()
         return [_stored_event(row) for row in reversed(rows)]
 

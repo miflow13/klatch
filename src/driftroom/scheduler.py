@@ -23,6 +23,12 @@ class Scheduler:
 
     Baseline talkativeness is ``1 - reserved`` and is scaled by energy and
     attention. Missing state is neutral (1 for both, 0 for affinity).
+
+    Cooldown: an agent is not re-asked within ``speaker_cooldown_ms`` of its
+    last decision (speak or wait). Given ``last_decision_ms``, an agent whose
+    last decision is that recent loses ``cooldown_penalty`` with reason
+    ``decision_cooldown``; an agent that spoke that recently gets the same
+    penalty with reason ``cooldown``. At most one cooldown penalty applies.
     """
 
     def __init__(self, config: SchedulerConfig, *, rng: Random | None = None) -> None:
@@ -38,6 +44,7 @@ class Scheduler:
         energy: Mapping[str, float] | None = None,
         attention: Mapping[str, float] | None = None,
         relationship_affinity: Mapping[str, float] | None = None,
+        last_decision_ms: Mapping[str, int] | None = None,
     ) -> list[CandidateScore]:
         visible = [event for event in events if event.type in VISIBLE_EVENT_TYPES]
         messages = [event for event in visible if event.type == "message"]
@@ -89,13 +96,16 @@ class Scheduler:
                 if overlap and self.config.topic_overlap_weight:
                     score += self.config.topic_overlap_weight * overlap
                     reasons.append("topic_overlap")
-            if (
-                self.config.cooldown_penalty
-                and own_messages
-                and now_ms - own_messages[-1].sim_ms < self.config.speaker_cooldown_ms
-            ):
-                score -= self.config.cooldown_penalty
-                reasons.append("cooldown")
+            if self.config.cooldown_penalty:
+                last_decision = (
+                    last_decision_ms.get(agent.id) if last_decision_ms is not None else None
+                )
+                if own_messages and now_ms - own_messages[-1].sim_ms < self.config.speaker_cooldown_ms:
+                    score -= self.config.cooldown_penalty
+                    reasons.append("cooldown")
+                elif last_decision is not None and now_ms - last_decision < self.config.speaker_cooldown_ms:
+                    score -= self.config.cooldown_penalty
+                    reasons.append("decision_cooldown")
             if (
                 self.config.recent_speaker_penalty
                 and latest_message is not None
@@ -122,6 +132,7 @@ class Scheduler:
         energy: Mapping[str, float] | None = None,
         attention: Mapping[str, float] | None = None,
         relationship_affinity: Mapping[str, float] | None = None,
+        last_decision_ms: Mapping[str, int] | None = None,
     ) -> CandidateScore | None:
         return self.select_from(
             self.score_agents(
@@ -131,6 +142,7 @@ class Scheduler:
                 energy=energy,
                 attention=attention,
                 relationship_affinity=relationship_affinity,
+                last_decision_ms=last_decision_ms,
             )
         )
 

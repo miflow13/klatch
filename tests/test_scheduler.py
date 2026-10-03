@@ -116,6 +116,40 @@ def test_cooldown_penalty_expires_at_configured_boundary() -> None:
     assert "cooldown" in inside.reasons
 
 
+def test_recent_decision_applies_cooldown_until_configured_boundary() -> None:
+    june = agent("june", "June")
+    scheduler = Scheduler(
+        neutral_config(cooldown_penalty=1.0, speaker_cooldown_ms=20_000), rng=Random(3)
+    )
+
+    fresh = scheduler.score_agents([june], [], 50_000)[0]
+    inside = scheduler.score_agents([june], [], 50_000, last_decision_ms={"june": 40_000})[0]
+    expired = scheduler.score_agents([june], [], 50_000, last_decision_ms={"june": 30_000})[0]
+    other = scheduler.score_agents([june], [], 50_000, last_decision_ms={"milo": 40_000})[0]
+
+    assert fresh.score - inside.score == pytest.approx(1.0)
+    assert inside.reasons == ("decision_cooldown",)
+    assert expired.score == fresh.score and "decision_cooldown" not in expired.reasons
+    assert other == fresh
+
+
+def test_speaker_and_decision_cooldowns_apply_at_most_one_penalty() -> None:
+    june = agent("june", "June")
+    scheduler = Scheduler(
+        neutral_config(cooldown_penalty=1.0, speaker_cooldown_ms=20_000), rng=Random(3)
+    )
+    spoke = [message(1, 40_000, "june", "hi")]
+
+    speaking = scheduler.score_agents([june], spoke, 50_000)[0]
+    both = scheduler.score_agents([june], spoke, 50_000, last_decision_ms={"june": 40_000})[0]
+    selected = scheduler.select_candidate([june], spoke, 50_000, last_decision_ms={"june": 40_000})
+
+    assert both == speaking
+    assert both.score == pytest.approx(-1.0)
+    assert both.reasons == ("cooldown",)
+    assert selected is None
+
+
 def test_latest_speaker_gets_recent_participation_penalty() -> None:
     june = agent("june", "June")
     scheduler = Scheduler(neutral_config(recent_speaker_penalty=0.45), rng=Random(3))

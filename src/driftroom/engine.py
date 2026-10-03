@@ -1,4 +1,10 @@
-"""Single-threaded loop: control, ambient, scheduling, one inference, commit, notify."""
+"""Single-threaded loop: control, ambient, scheduling, one inference, commit, notify.
+
+Persistence errors (for example a failing ``commit_event``) propagate out of
+``step()``/``run()`` unchanged. The engine fabricates nothing for the lost event
+and shows nothing to observers, and it does not try to end the session itself:
+the CLI that owns the process owns handling the crash.
+"""
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -14,7 +20,7 @@ from .models.base import BackendError, ModelBackend
 from .prompting import (
     TRAIT_RENDERER_VERSION, TURN_FORMAT_VERSION, TurnContext, build_turn_messages, prompt_template_hash,
 )
-from .scheduler import Scheduler
+from .scheduler import CandidateScore, Scheduler
 from .storage import EventRecord, EventStore, RunRecord, StoredEvent
 
 
@@ -67,6 +73,9 @@ class SimulationEngine:
         self._ended = False
         self._last_visible_ms: int | None = None
         self._last_ambient_ms: int | None = None
+        # Per-agent sim_ms of the last committed decision (speak or wait), fed to
+        # the scheduler's decision cooldown.
+        self._last_decision_ms: dict[str, int] = {}
 
     def start(self) -> int:
         runtime = self.config.runtime
@@ -75,6 +84,10 @@ class SimulationEngine:
             self.store.create_run(
                 RunRecord(self.run_id, self.room_id, self.wall_clock().isoformat(), self.config)
             )
+        # A stop request belongs to the session it stopped; left in place it would end
+        # this one on its first step. A paused room stays paused (`resume` lifts it).
+        if self.store.get_control(self.room_id).desired_state == "stop_requested":
+            self.store.set_control(self.room_id, "running")
         # Resume from the last persisted moment; downtime produces no events.
         last = self.store.read_recent_events(self.run_id, 1)
         if self.clock is None:
@@ -84,6 +97,9 @@ class SimulationEngine:
             )
         if self.scheduler is None:
             self.scheduler = Scheduler(self.config.scheduler, rng=Random(runtime.random_seed))
+        # Restore decision cooldowns so a restart does not immediately re-ask everyone.
+        for event in self.store.read_recent_events(self.run_id, runtime.recent_context_events):
+            self._remember_decision(event.type, event.agent_id, event.sim_ms)
         prompt_hash = prompt_template_hash()
         self._sim_start_ms = self.clock.now_ms()
         return self._commit("session_started", None, self._sim_start_ms, {
@@ -118,23 +134,50 @@ class SimulationEngine:
         if desired == "stop_requested":
             return EngineStepResult("stopped", self.stop())
         if desired == "paused":
-            self.sleep_fn(tick_ms / 1_000)  # never advance_ms: a paused room accrues no simulated time
+            # Never advance_ms: a paused accelerated room accrues no simulated time.
+            # A realtime clock follows wall time, so time spent paused still counts
+            # as simulation time there; that is deliberate for v0.1 (§13A says
+            # realtime sim time approximately follows wall time).
+            self.sleep_fn(tick_ms / 1_000)
             return EngineStepResult("paused", None)
-        recent = self.store.read_recent_events(self.run_id, self.config.runtime.recent_context_events)
+        # The window is bounded over visible events: agent_wait, attempt_failed and
+        # session_* rows must never push the transcript out of the prompt or hide
+        # mention/overlap/cooldown signals from the scheduler.
+        recent = self.store.read_recent_events(
+            self.run_id, self.config.runtime.recent_context_events, types=VISIBLE_EVENT_TYPES
+        )
         now = self.clock.now_ms()
         if self._ambient_due(recent, now):
             return EngineStepResult("ambient", self._commit("environment", None, now, {"text": AMBIENT_SILENCE_TEXT}))
         candidate = self.scheduler.select_from(
-            self.scheduler.score_agents(self.config.agents, recent, now)
+            self.scheduler.score_agents(
+                self.config.agents, recent, now, last_decision_ms=self._last_decision_ms
+            )
         )
         if candidate is None:
             self.scheduler.wait_for_next_tick(self.clock, sleep_fn=self.sleep_fn)
             return EngineStepResult("idle", None)
+        result = self._decide(candidate, recent, now)
+        # Every decision consumes one tick of simulated time, like an idle step, so
+        # the next opportunity follows simulation time rather than how fast the
+        # model answered (§13A, §15). The decision itself is stamped with ``now``.
+        self.scheduler.wait_for_next_tick(self.clock, sleep_fn=self.sleep_fn)
+        return result
+
+    def _decide(self, candidate: CandidateScore, recent: Sequence[StoredEvent], now: int) -> EngineStepResult:
         agent = next(agent for agent in self.config.agents if agent.id == candidate.agent_id)
         messages = build_turn_messages(TurnContext(agent, recent, now))
         selection = {"scheduler_score": candidate.score, "reasons": list(candidate.reasons)}
         attempts = 1 + self.config.runtime.retry_count
         for attempt in range(1, attempts + 1):
+            if attempt > 1:
+                # A retry is another generation: honour pause/stop before it (§24A).
+                desired = self.store.get_control(self.room_id).desired_state
+                if desired != "running":
+                    return EngineStepResult("generation_failed", self._commit("generation_failed", agent.id, now, {
+                        "attempts": attempt - 1, "last_error_class": type(last_error).__name__,
+                        "interrupted_by_control": desired,
+                    }))
             try:
                 result = self.backend.decide(agent, messages)
             except BackendError as exc:
@@ -159,10 +202,10 @@ class SimulationEngine:
         }))
 
     def _ambient_due(self, recent: Sequence[StoredEvent], now: int) -> bool:
-        # The bounded window alone is not enough: in a quiet room agent_wait events
-        # crowd visible and ambient events out of it. So the engine also remembers
-        # what it committed this session. Events older than both the window and this
-        # session (e.g. before a restart) are treated as absent (accepted for v0.1).
+        # ``recent`` holds only visible events, so the last ambient event stays in
+        # the window (also across a restart) unless more than N visible events
+        # followed it, in which case the room was not silent anyway. The in-memory
+        # times committed this session remain as a fallback.
         scheduler = self.config.scheduler
         visible = [event.sim_ms for event in recent if event.type in VISIBLE_EVENT_TYPES]
         ambient = [event.sim_ms for event in recent if event.type == "environment"]
@@ -190,23 +233,39 @@ class SimulationEngine:
         if self._ended:
             return None
         now = self.clock.now_ms()
-        event_id = self._commit("session_ended", None, now, {"sim_end_ms": now})
+        event = self._persist("session_ended", None, now, {"sim_end_ms": now})
+        # Ended once committed, even if an observer then raises: stop() stays idempotent.
         self._ended = True
-        return event_id
+        self._notify(event)
+        return event.id
+
+    def _remember_decision(self, event_type: str, agent_id: str | None, sim_ms: int) -> None:
+        if event_type in ("agent_wait", "message") and agent_id is not None:
+            self._last_decision_ms[agent_id] = sim_ms
 
     def _commit(
         self, event_type: str, agent_id: str | None, sim_ms: int, payload: dict[str, object]
     ) -> int:
         """Persist first; observers only ever see committed events (spec §37)."""
+        event = self._persist(event_type, agent_id, sim_ms, payload)
+        self._notify(event)
+        return event.id
+
+    def _persist(
+        self, event_type: str, agent_id: str | None, sim_ms: int, payload: dict[str, object]
+    ) -> StoredEvent:
         record = EventRecord(self.run_id, self.wall_clock().isoformat(), sim_ms, event_type, agent_id, payload)
         event_id = self.store.commit_event(record)
         if event_type in VISIBLE_EVENT_TYPES:
             self._last_visible_ms = sim_ms
         if event_type == "environment":
             self._last_ambient_ms = sim_ms
+        self._remember_decision(event_type, agent_id, sim_ms)
+        return StoredEvent(
+            event_id, record.run_id, record.wall_ts, record.sim_ms,
+            record.type, record.agent_id, dict(payload),
+        )
+
+    def _notify(self, event: StoredEvent) -> None:
         if self.observer is not None:
-            self.observer(StoredEvent(
-                event_id, record.run_id, record.wall_ts, record.sim_ms,
-                record.type, record.agent_id, dict(payload),
-            ))
-        return event_id
+            self.observer(event)
