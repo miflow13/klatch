@@ -1,0 +1,201 @@
+"""Observer-only run analysis over persisted events (spec §31, §32)."""
+
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from driftroom import analysis
+from driftroom.analysis import RunMetrics, analyze_run
+from driftroom.config import load_run_config
+from driftroom.domain import RunConfig
+from driftroom.storage import EventRecord, EventStore, RunRecord, StoredEvent
+
+
+EXAMPLE_CONFIG = Path(__file__).resolve().parents[1] / "driftroom.example.toml"
+WALL = "2026-10-01T12:00:00+00:00"
+SILENCE_MS = 60_000
+
+
+def make_config() -> RunConfig:
+    data = load_run_config(EXAMPLE_CONFIG).model_dump(mode="json")
+    data["scheduler"]["silence_ambient_after_ms"] = SILENCE_MS
+    return RunConfig.model_validate(data)
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> Iterator[EventStore]:
+    """A seeded run store, always closed (Python 3.13+ warns on unclosed sqlite connections)."""
+    store = EventStore(tmp_path / "room.sqlite3")
+    try:
+        store.initialize()
+        store.create_run(RunRecord("run-1", "room-1", WALL, make_config()))
+        yield store
+    finally:
+        store.close()
+
+
+def add(store: EventStore, event_type: str, sim_ms: int, payload: dict[str, Any] | None = None,
+        agent_id: str | None = None, run_id: str = "run-1") -> int:
+    return store.commit_event(EventRecord(run_id, WALL, sim_ms, event_type, agent_id, payload or {}))
+
+
+def say(store: EventStore, agent_id: str, sim_ms: int, text: str, latency_ms: float = 100.0) -> int:
+    return add(store, "message", sim_ms, {
+        "speaker": agent_id.title(), "message": text, "target": None,
+        "scheduler_score": 0.5, "reasons": [], "latency_ms": latency_ms,
+        "prompt_tokens": None, "output_tokens": None, "model": "qwen3:4b", "attempt": 1,
+    }, agent_id)
+
+
+def wait(store: EventStore, agent_id: str, sim_ms: int, latency_ms: float = 100.0) -> int:
+    return add(store, "agent_wait", sim_ms, {
+        "scheduler_score": 0.5, "reasons": [], "latency_ms": latency_ms,
+        "prompt_tokens": None, "output_tokens": None, "model": "qwen3:4b", "attempt": 1,
+    }, agent_id)
+
+
+def fail(store: EventStore, agent_id: str, sim_ms: int, error_class: str) -> int:
+    return add(store, "attempt_failed", sim_ms, {
+        "attempt": 1, "error_class": error_class, "error": "boom", "scheduler_score": 0.5, "reasons": [],
+    }, agent_id)
+
+
+class ReadOnlyStore:
+    """Exposes only the store's read API, so any write attempt fails loudly."""
+
+    READS = frozenset({"read_events", "get_run"})
+
+    def __init__(self, store: EventStore) -> None:
+        self._store = store
+        self.calls: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        if name not in self.READS:
+            raise AssertionError(f"analysis touched EventStore.{name}")
+        self.calls.append(name)
+        return getattr(self._store, name)
+
+
+def all_events(store: EventStore) -> list[StoredEvent]:
+    return store.read_events("run-1", limit=100_000)
+
+
+def test_analyze_run_reports_every_metric_for_a_synthetic_run(store) -> None:
+    add(store, "session_started", 0)
+    say(store, "june", 0, "hey", latency_ms=100.0)                      # 1 word
+    wait(store, "milo", 5_000, latency_ms=300.0)
+    say(store, "milo", 10_000, "That's a great point, as an AI I agree", latency_ms=200.0)  # 9 words
+    fail(store, "ada", 15_000, "BackendTimeoutError")
+    fail(store, "ada", 15_000, "DecisionValidationError")
+    add(store, "generation_failed", 15_000, {"attempts": 2, "last_error_class": "DecisionValidationError"}, "ada")
+    fail(store, "ada", 20_000, "BackendTimeoutError")
+    wait(store, "ada", 20_000, latency_ms=400.0)
+    add(store, "environment", 70_000, {"text": "the room has been quiet for a while"})  # 60 s gap: silence
+    say(store, "june", 75_000, "in conclusion idk lol", latency_ms=500.0)  # 4 words
+    add(store, "session_ended", 75_000, {"sim_end_ms": 75_000})
+    # Another run in the same file must not leak into this run's metrics.
+    store.create_run(RunRecord("run-2", "room-2", WALL, make_config()))
+    add(store, "message", 0, {"speaker": "June", "message": "As an AI, other run", "target": None,
+                              "latency_ms": 9_999.0}, "june", run_id="run-2")
+
+    reader = ReadOnlyStore(store)
+    metrics = analyze_run(reader, "run-1")
+
+    assert metrics == RunMetrics(
+        visible_messages=3,
+        valid_waits=2,
+        generation_failures=1,
+        attempt_failures=3,
+        messages_per_agent={"june": 2, "milo": 1, "ada": 0},
+        mean_message_words=(1 + 9 + 4) / 3,
+        median_message_words=4.0,
+        assistant_phrase_hits=3,
+        as_an_ai_hits=1,
+        silence_periods=1,
+        ambient_events=1,
+        mean_inference_ms=(100.0 + 300.0 + 200.0 + 400.0 + 500.0) / 5,
+        failure_classes={"BackendTimeoutError": 2, "DecisionValidationError": 1},
+    )
+    assert set(reader.calls) == {"read_events", "get_run"}
+
+
+def test_empty_run_has_zero_counts_and_no_inference_mean(store) -> None:
+    add(store, "session_started", 0)
+
+    metrics = analyze_run(store, "run-1")
+
+    assert metrics == RunMetrics(
+        visible_messages=0, valid_waits=0, generation_failures=0, attempt_failures=0,
+        messages_per_agent={"june": 0, "milo": 0, "ada": 0},
+        mean_message_words=0.0, median_message_words=0.0,
+        assistant_phrase_hits=0, as_an_ai_hits=0, silence_periods=0, ambient_events=0,
+        mean_inference_ms=None, failure_classes={},
+    )
+
+
+def test_unknown_run_is_an_error(store) -> None:
+    with pytest.raises(KeyError, match="run-x"):
+        analyze_run(store, "run-x")
+
+
+@pytest.mark.parametrize("phrase", [
+    "That's a great point", "I completely agree", "Building on what you said",
+    "It's important to note", "In conclusion", "As an AI",
+])
+def test_each_spec_assistant_phrase_is_detected_case_insensitively(store, phrase) -> None:
+    say(store, "june", 0, f"ok {phrase.upper()}. and again: {phrase.lower()}!")
+
+    metrics = analyze_run(store, "run-1")
+
+    assert metrics.assistant_phrase_hits == 2
+    assert metrics.as_an_ai_hits == (2 if phrase == "As an AI" else 0)
+
+
+def test_phrase_scan_matches_whole_phrases_only_and_ignores_environment_text(store) -> None:
+    say(store, "june", 0, "she worked as an aide; in conclusionary terms, whatever")
+    add(store, "environment", 1_000, {"text": "As an AI, in conclusion"})
+
+    metrics = analyze_run(store, "run-1")
+
+    assert (metrics.assistant_phrase_hits, metrics.as_an_ai_hits) == (0, 0)
+
+
+def test_analysis_never_alters_persisted_text(store) -> None:
+    say(store, "june", 0, "  As an AI,   I completely agree\n\nIn Conclusion  ")
+    before = all_events(store)
+
+    analyze_run(store, "run-1")
+
+    assert all_events(store) == before
+
+
+def test_silence_periods_count_visible_gaps_at_or_over_the_threshold(store) -> None:
+    add(store, "session_started", 0)
+    say(store, "june", 0, "a")
+    wait(store, "milo", 30_000)                        # invisible: does not break the silence
+    say(store, "milo", SILENCE_MS, "b")                # gap == threshold: silence
+    add(store, "environment", 2 * SILENCE_MS - 1, {"text": "quiet"})  # gap just under: not silence
+    say(store, "ada", 4 * SILENCE_MS, "c")             # long gap: still one period
+    wait(store, "june", 5 * SILENCE_MS)                # trailing gap to the last event: silence
+
+    assert analyze_run(store, "run-1").silence_periods == 3
+
+
+def test_trailing_gap_under_threshold_is_not_silence(store) -> None:
+    say(store, "june", 0, "a")
+    add(store, "session_ended", SILENCE_MS - 1, {"sim_end_ms": SILENCE_MS - 1})
+
+    assert analyze_run(store, "run-1").silence_periods == 0
+
+
+def test_analysis_pages_through_every_event(store, monkeypatch) -> None:
+    monkeypatch.setattr(analysis, "PAGE_SIZE", 2)
+    for index in range(7):
+        say(store, "june", index * 1_000, f"line {index}")
+
+    metrics = analyze_run(store, "run-1")
+
+    assert metrics.visible_messages == 7
+    assert metrics.messages_per_agent["june"] == 7
