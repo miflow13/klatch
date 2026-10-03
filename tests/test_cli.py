@@ -284,6 +284,7 @@ class FakeTime:
 
 def fake_realtime_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, mode: str, steps: int, creep: float = 0.0,
+    scheduler: dict[str, str] | None = None,
 ) -> str:
     """Run `start --fake` under a fake clock that only advances through the engine's 5 s tick sleeps."""
     import driftroom.engine as engine_module
@@ -298,8 +299,10 @@ def fake_realtime_start(
     )
     text = write_config(tmp_path / "run.toml").read_text(encoding="utf-8")
     text = re.sub(r"^clock_mode = .*$", f'clock_mode = "{mode}"', text, flags=re.M)
-    # No agent ever qualifies, so every step is idle.
-    text = re.sub(r"^base_bias = .*$", "base_bias = -50.0", text, flags=re.M)
+    # By default no agent ever qualifies, so every step is idle.
+    for key, value in (scheduler or {"base_bias": "-50.0"}).items():
+        text, count = re.subn(rf"^{key} = .*$", f"{key} = {value}", text, flags=re.M)
+        assert count == 1, key
     (tmp_path / "run.toml").write_text(text, encoding="utf-8")
     result = runner.invoke(cli_app(), [
         "start", "--config", str(tmp_path / "run.toml"), "--db", str(tmp_path / "room.db"),
@@ -332,7 +335,8 @@ def test_a_non_idle_step_resets_the_heartbeat_timer() -> None:
 
     now = [0.0]
     printed: list[str] = []
-    beat = _idle_heartbeat(lambda: 0, printed.append, every_seconds=30.0, monotonic=lambda: now[0])
+    # The sim clock follows the fake wall clock, so the line shows when the beat fired.
+    beat = _idle_heartbeat(lambda: int(now[0] * 1000), printed.append, every_seconds=30.0, monotonic=lambda: now[0])
     idle, message = EngineStepResult("idle", None), EngineStepResult("message", 1)
 
     now[0] = 29.0
@@ -341,10 +345,26 @@ def test_a_non_idle_step_resets_the_heartbeat_timer() -> None:
     beat(message)  # a decision: the 30 s window starts over
     now[0] = 60.0
     beat(idle)
+    assert printed == []  # 29 s after the decision; without the reset this would already have beaten
+
     now[0] = 61.0
     beat(idle)
+    assert printed == ["idle  sim 00:01:01"]  # 30 s after the decision at 31 s, not at 60 s
 
-    assert printed == ["idle  sim 00:00:00"]  # only at 61 s, 30 s after the decision at 31 s
+
+def test_start_counts_the_heartbeat_window_from_the_last_decision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Each of the three agents is asked once (speak, wait, speak: 5 s ticks, sim 0-10 s) and then
+    # sits on a cooldown that outlasts the run, so every later step is idle. The window restarts
+    # when the last decision's step ends at 15 s, so the first beat is at 45 s. Without the reset
+    # it would fall at 30 s, counted from the start of the run.
+    forced = {key: str(value) for key, value in FORCED.items()}
+    scheduler = {**forced, "cooldown_penalty": "1.0", "speaker_cooldown_ms": "100000000", "wait_cooldown_ms": "100000000"}
+    output = fake_realtime_start(tmp_path, monkeypatch, mode="realtime", steps=10, scheduler=scheduler)
+
+    assert read_types(tmp_path / "room.db", "run-hb") == [
+        "session_started", "message", "agent_wait", "message", "session_ended",
+    ]
+    assert re.findall(r"^idle  sim (\d\d:\d\d:\d\d)$", output, flags=re.M) == ["00:00:45"]
 
 
 def test_start_stops_the_engine_on_keyboard_interrupt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
