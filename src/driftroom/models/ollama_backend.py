@@ -6,11 +6,13 @@ from typing import Any, TypeVar
 
 import httpx
 import ollama
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from driftroom.domain import AgentConfig, RuntimeConfig
 
 from .base import (
+    ENVELOPE_SPEAK,
+    ENVELOPE_WAIT,
     BackendError,
     BackendTimeoutError,
     Decision,
@@ -27,6 +29,11 @@ from .base import (
 
 
 _T = TypeVar("_T")
+
+# Envelope literal -> design action (spec §11); see ``ENVELOPE_SPEAK``.
+_ENVELOPE_ACTIONS = {ENVELOPE_SPEAK: "speak", ENVELOPE_WAIT: "wait"}
+# Pydantic's JSON parser, so malformed content keeps the same "Invalid JSON" detail.
+_JSON = TypeAdapter(Any)
 
 
 def _field(value: object, key: str) -> Any:
@@ -109,7 +116,16 @@ class OllamaBackend(ModelBackend):
                 "Ollama returned empty decision content", raw_excerpt=excerpt, detail="empty content"
             )
         try:
-            decision = Decision.model_validate_json(content)
+            envelope = _JSON.validate_json(content)
+            if isinstance(envelope, dict):
+                action = envelope.get("action")
+                if not isinstance(action, str) or action not in _ENVELOPE_ACTIONS:
+                    raise DecisionValidationError(
+                        "Ollama decision violates schema", raw_excerpt=excerpt, detail="unknown envelope action"
+                    )
+                envelope = {**envelope, "action": _ENVELOPE_ACTIONS[action]}
+            # Decision stays the backstop for everything the grammar should already enforce.
+            decision = Decision.model_validate(envelope)
         except ValidationError as exc:
             raise DecisionValidationError(
                 "Ollama decision violates schema", raw_excerpt=excerpt, detail=validation_detail(exc)

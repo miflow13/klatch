@@ -323,7 +323,7 @@ def test_real_failing_samples_record_raw_excerpt_and_detail_on_attempt_failed(tm
         assert event.payload == {
             "attempt": attempt, "error_class": "DecisionValidationError",
             "error": "Ollama decision violates schema", "raw_excerpt": sample,
-            "detail": "wait requires a null message", "scheduler_score": 1.0, "reasons": [],
+            "detail": "unknown envelope action", "scheduler_score": 1.0, "reasons": [],
         }
     assert failed == EngineStepResult("generation_failed", committed[4].id)
     assert [call["format"] for call in client.calls] == [decision_schema(["Milo", "Ada"])] * 3

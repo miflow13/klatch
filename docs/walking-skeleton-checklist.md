@@ -53,6 +53,14 @@ driftroom start --db room.sqlite3 --config driftroom.example.toml
 >   `target` limited to the other participants' display names (or null), WAIT carries null
 >   message and target. It is part of the recorded regime via `engine_version`
 >   (`driftroom-engine-0.1.1` introduced it).
+> - The envelope's JSON `action` literals are `say` and `quiet`, mapped back to SPEAK and
+>   WAIT by the backend; the design's actions and events are unchanged. Under the old
+>   `speak`/`wait` literals, qwen3:4b's reasoning interjection "Wait, ..." (it deliberates in
+>   its answer even with thinking disabled) made the grammar pick `wait` with probability
+>   ~1.0, even when the agent was asked a direct question (Ollama log-probs, 2026-10-03).
+>   The literals and the reworded NEXT ACTION sentence are part of the recorded regime
+>   (`driftroom-engine-0.1.3`); the gate runs `gate-2` and `gate-3` were recorded under the
+>   old `speak`/`wait` literals.
 > - `runtime.startup_mode` selects what a **fresh** start writes, right after
 >   `session_started` and at the same simulated time; a restart writes nothing extra:
 >   - `blank` (the spec default): nothing. The first prompt's ROOM HISTORY reads

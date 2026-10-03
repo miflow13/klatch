@@ -16,6 +16,8 @@ from driftroom.models.base import (
     DecisionValidationError,
     EmptyModelContentError,
     ModelInfo,
+    ENVELOPE_SPEAK,
+    ENVELOPE_WAIT,
     TruncatedGenerationError,
     decision_schema,
 )
@@ -165,13 +167,18 @@ def conforms(schema: dict[str, object], value: object) -> bool:
     return True
 
 
+def test_envelope_literals_are_say_and_quiet() -> None:
+    # "wait" collided with Qwen3's reasoning interjection (logprob evidence, 2026-10-03).
+    assert (ENVELOPE_SPEAK, ENVELOPE_WAIT) == ("say", "quiet")
+
+
 def test_decision_schema_is_a_two_branch_speak_wait_contract() -> None:
     assert decision_schema(["June", "Ada"]) == {
         "type": "object",
         "anyOf": [
             {
                 "properties": {
-                    "action": {"const": "speak"},
+                    "action": {"const": "say"},
                     "message": {"type": "string", "minLength": 1},
                     "target": {"anyOf": [{"enum": ["June", "Ada"]}, {"type": "null"}]},
                 },
@@ -180,7 +187,7 @@ def test_decision_schema_is_a_two_branch_speak_wait_contract() -> None:
             },
             {
                 "properties": {
-                    "action": {"const": "wait"},
+                    "action": {"const": "quiet"},
                     "message": {"type": "null"},
                     "target": {"type": "null"},
                 },
@@ -200,15 +207,18 @@ def test_decision_schema_without_participants_only_allows_a_null_target() -> Non
 
 def test_decision_schema_accepts_the_contract_and_nothing_else() -> None:
     schema = decision_schema(["June", "Ada"])
-    assert conforms(schema, {"action": "speak", "message": "hi", "target": "Ada"})
-    assert conforms(schema, {"action": "speak", "message": "hi", "target": None})
-    assert conforms(schema, {"action": "wait", "message": None, "target": None})
-    assert not conforms(schema, {"action": "speak", "message": "", "target": None})
-    assert not conforms(schema, {"action": "speak", "message": "hi", "target": "nobody"})
-    assert not conforms(schema, {"action": "wait", "message": None, "target": "Ada"})
-    assert not conforms(schema, {"action": "wait", "message": None})
-    assert not conforms(schema, {"action": "wait", "message": None, "target": None, "extra": 1})
-    assert not conforms(decision_schema([]), {"action": "speak", "message": "hi", "target": "Ada"})
+    assert conforms(schema, {"action": "say", "message": "hi", "target": "Ada"})
+    assert conforms(schema, {"action": "say", "message": "hi", "target": None})
+    assert conforms(schema, {"action": "quiet", "message": None, "target": None})
+    assert not conforms(schema, {"action": "say", "message": "", "target": None})
+    assert not conforms(schema, {"action": "say", "message": "hi", "target": "nobody"})
+    assert not conforms(schema, {"action": "quiet", "message": None, "target": "Ada"})
+    assert not conforms(schema, {"action": "quiet", "message": None})
+    assert not conforms(schema, {"action": "quiet", "message": None, "target": None, "extra": 1})
+    assert not conforms(decision_schema([]), {"action": "say", "message": "hi", "target": "Ada"})
+    # The design's action names are no longer envelope literals.
+    assert not conforms(schema, {"action": "speak", "message": "hi", "target": None})
+    assert not conforms(schema, {"action": "wait", "message": None, "target": None})
 
 
 @pytest.mark.parametrize("sample", REAL_SAMPLES)
@@ -224,18 +234,19 @@ def test_validation_error_carries_raw_excerpt_and_detail(sample: str) -> None:
     with pytest.raises(DecisionValidationError) as caught:
         backend(client).decide(AGENT, MESSAGES, targets=["Milo", "Ada"])
     assert caught.value.raw_excerpt == sample
-    assert caught.value.detail == "wait requires a null message"
+    # The grammar can no longer emit "wait"; the envelope check rejects it first.
+    assert caught.value.detail == "unknown envelope action"
 
 
 def test_validation_detail_names_the_field_for_field_errors() -> None:
-    client = RecordingClient(response('{"action":"speak","message":"hi","target":42}'))
+    client = RecordingClient(response('{"action":"say","message":"hi","target":42}'))
     with pytest.raises(DecisionValidationError) as caught:
         backend(client).decide(AGENT, MESSAGES)
     assert caught.value.detail == "target: Input should be a valid string"
 
 
 def test_validation_detail_escapes_model_chosen_keys() -> None:
-    client = RecordingClient(response('{"action":"wait","message":null,"target":null,"\\u001b[2J":1}'))
+    client = RecordingClient(response('{"action":"quiet","message":null,"target":null,"\\u001b[2J":1}'))
     with pytest.raises(DecisionValidationError) as caught:
         backend(client).decide(AGENT, MESSAGES)
     assert caught.value.detail == "\\x1b[2J: Extra inputs are not permitted"
@@ -253,10 +264,10 @@ def test_raw_excerpt_is_bounded_and_escaped_without_touching_the_content() -> No
 
 
 def test_truncated_and_empty_errors_carry_raw_excerpt_and_detail() -> None:
-    client = RecordingClient(response('{"action":"speak","message":"cut', done_reason="length"))
+    client = RecordingClient(response('{"action":"say","message":"cut', done_reason="length"))
     with pytest.raises(TruncatedGenerationError) as truncated:
         backend(client).decide(AGENT, MESSAGES)
-    assert truncated.value.raw_excerpt == '{"action":"speak","message":"cut'
+    assert truncated.value.raw_excerpt == '{"action":"say","message":"cut'
     assert truncated.value.detail == "done_reason=length"
 
     client = RecordingClient(response("  \n "))
@@ -272,7 +283,7 @@ def test_infrastructure_errors_carry_no_raw_content() -> None:
 
 
 def test_ollama_sends_the_per_agent_schema_for_the_given_targets() -> None:
-    client = RecordingClient(response('{"action":"wait","message":null,"target":null}'))
+    client = RecordingClient(response('{"action":"quiet","message":null,"target":null}'))
     backend(client).decide(AGENT, MESSAGES, targets=["Milo", "Ada"])
     backend(client).decide(AGENT, MESSAGES)
     assert client.calls[0]["format"] == decision_schema(["Milo", "Ada"])
@@ -281,7 +292,7 @@ def test_ollama_sends_the_per_agent_schema_for_the_given_targets() -> None:
 
 
 def test_ollama_sends_exact_constrained_request_and_retains_metadata() -> None:
-    client = RecordingClient(response('{"action":"speak","message":"hello","target":"Kai"}'))
+    client = RecordingClient(response('{"action":"say","message":"hello","target":"Kai"}'))
     result = backend(client).decide(AGENT, MESSAGES, targets=["Kai"])
 
     assert client.calls == [
@@ -312,7 +323,7 @@ def test_ollama_sends_exact_constrained_request_and_retains_metadata() -> None:
 
 
 def test_valid_wait_remains_a_model_result() -> None:
-    client = RecordingClient(response('{"action":"wait","message":null,"target":null}'))
+    client = RecordingClient(response('{"action":"quiet","message":null,"target":null}'))
     result = backend(client).decide(AGENT, MESSAGES)
     assert result.decision == Decision(action="wait", message=None, target=None)
     assert len(client.calls) == 1
@@ -321,10 +332,10 @@ def test_valid_wait_remains_a_model_result() -> None:
 @pytest.mark.parametrize(
     "content",
     [
-        '{"action":"speak","message":"  ","target":null}',
-        '{"action":"wait","message":"no","target":null}',
-        '{"action":"speak","message":"hi","target":42}',
-        '{"action":"wait"}',
+        '{"action":"say","message":"  ","target":null}',
+        '{"action":"quiet","message":"no","target":null}',
+        '{"action":"say","message":"hi","target":42}',
+        '{"action":"quiet"}',
         "not json",
     ],
 )
@@ -333,6 +344,48 @@ def test_invalid_model_decision_raises_validation_error(content: str) -> None:
     with pytest.raises(DecisionValidationError):
         backend(client).decide(AGENT, MESSAGES)
     assert len(client.calls) == 1
+
+
+def test_say_envelope_maps_to_a_speak_decision() -> None:
+    client = RecordingClient(response('{"action":"say","message":"hi","target":"Ada"}'))
+    result = backend(client).decide(AGENT, MESSAGES, targets=["Ada"])
+    assert result.decision == Decision(action="speak", message="hi", target="Ada")
+    assert len(client.calls) == 1
+
+
+def test_quiet_envelope_maps_to_a_wait_decision() -> None:
+    client = RecordingClient(response('{"action":"quiet","message":null,"target":null}'))
+    result = backend(client).decide(AGENT, MESSAGES)
+    assert result.decision == Decision(action="wait", message=None, target=None)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        # Legacy literals: the grammar can no longer produce them.
+        '{"action":"wait","message":null,"target":null}',
+        '{"action":"speak","message":"hi","target":null}',
+        '{"action":"SAY","message":"hi","target":null}',
+        '{"action":42,"message":null,"target":null}',
+        '{"action":["say"],"message":"hi","target":null}',
+        '{"message":null,"target":null}',
+    ],
+)
+def test_unknown_envelope_action_raises_validation_error(content: str) -> None:
+    client = RecordingClient(response(content))
+    with pytest.raises(DecisionValidationError) as caught:
+        backend(client).decide(AGENT, MESSAGES)
+    assert caught.value.detail == "unknown envelope action"
+    assert caught.value.raw_excerpt == content
+    assert len(client.calls) == 1
+
+
+def test_mapped_envelope_is_still_validated_by_decision() -> None:
+    client = RecordingClient(response('{"action":"quiet","message":"psst","target":null}'))
+    with pytest.raises(DecisionValidationError) as caught:
+        backend(client).decide(AGENT, MESSAGES)
+    assert caught.value.detail == "wait requires a null message"
+    assert caught.value.raw_excerpt == '{"action":"quiet","message":"psst","target":null}'
 
 
 def test_empty_content_raises_distinct_error() -> None:
@@ -414,7 +467,7 @@ def test_non_read_httpx_timeouts_are_network_errors(error: Exception) -> None:
 
 
 def test_length_cutoff_with_partial_json_raises_truncated_error() -> None:
-    client = RecordingClient(response('{"action":"speak","mess', done_reason="length"))
+    client = RecordingClient(response('{"action":"say","mess', done_reason="length"))
     with pytest.raises(TruncatedGenerationError) as caught:
         backend(client).decide(AGENT, MESSAGES)
     assert isinstance(caught.value, DecisionValidationError)
@@ -424,7 +477,7 @@ def test_length_cutoff_with_partial_json_raises_truncated_error() -> None:
 
 
 def test_length_cutoff_with_complete_json_is_still_truncated() -> None:
-    content = '{"action":"wait","message":null,"target":null}'
+    content = '{"action":"quiet","message":null,"target":null}'
     client = RecordingClient(response(content, done_reason="length"))
     with pytest.raises(TruncatedGenerationError):
         backend(client).decide(AGENT, MESSAGES)
@@ -438,7 +491,7 @@ def test_length_cutoff_with_empty_content_is_truncated_not_empty() -> None:
 
 
 def test_stop_reason_with_valid_json_succeeds() -> None:
-    content = '{"action":"wait","message":null,"target":null}'
+    content = '{"action":"quiet","message":null,"target":null}'
     client = RecordingClient(response(content, done_reason="stop"))
     result = backend(client).decide(AGENT, MESSAGES)
     assert result.decision.action == "wait"
@@ -451,7 +504,7 @@ def test_default_client_uses_host_and_configured_timeout(
 
     def fake_client(**kwargs: object) -> RecordingClient:
         built.append(kwargs)
-        return RecordingClient(response('{"action":"wait","message":null,"target":null}'))
+        return RecordingClient(response('{"action":"quiet","message":null,"target":null}'))
 
     monkeypatch.setattr(ollama_backend.ollama, "Client", fake_client)
     OllamaBackend(RUNTIME, host="http://127.0.0.1:11999").decide(AGENT, MESSAGES)

@@ -13,6 +13,22 @@ from driftroom.observer import _escape_controls
 
 RAW_EXCERPT_CHARS = 300
 
+ENVELOPE_SPEAK = "say"
+ENVELOPE_WAIT = "quiet"
+"""The JSON strings the constrained grammar emits for the design's SPEAK and WAIT.
+
+The design's actions stay SPEAK/WAIT (spec §11); only the envelope literals differ,
+and backends map them back before ``Decision`` validates. Under the action-first
+grammar, qwen3:4b chose the literal ``wait`` with probability ~1.0 even when another
+agent asked it a direct question: ``think=False`` does not stop the model deliberating,
+it writes the deliberation into the content, and "wait" is Qwen3's reasoning
+interjection ("Wait, let me think..."), so the grammar harvested a thinking token as the
+social decision (Ollama log-probs, 2026-10-03). In 6-sample probes ``speak``/``wait``
+gave 6/6 wait both in an empty room and when addressed, while ``say``/``quiet`` gave
+2/6 quiet in an empty room and 6/6 say when addressed. The literals are part of the
+recorded regime (spec §33).
+"""
+
 
 class Decision(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -36,15 +52,18 @@ def decision_schema(targets: Sequence[str]) -> dict[str, Any]:
     Two closed branches let the grammar enforce what ``Decision`` validates
     after the fact: speak with a non-empty message and an optional participant
     target (``targets`` = the other agents' display names), or wait with nulls.
-    ``Decision`` stays the backstop for backends without grammar support.
+    The branches carry the envelope literals ``ENVELOPE_SPEAK``/``ENVELOPE_WAIT``
+    (``say``/``quiet``), not the action names; backends map them back to
+    speak/wait. ``Decision`` stays the backstop for backends without grammar
+    support.
     """
     names = list(targets)
     target = {"anyOf": [{"enum": names}, {"type": "null"}]} if names else {"type": "null"}
     return {"type": "object", "anyOf": [
-        {"properties": {"action": {"const": "speak"}, "message": {"type": "string", "minLength": 1},
+        {"properties": {"action": {"const": ENVELOPE_SPEAK}, "message": {"type": "string", "minLength": 1},
                         "target": target},
          "required": ["action", "message", "target"], "additionalProperties": False},
-        {"properties": {"action": {"const": "wait"}, "message": {"type": "null"}, "target": {"type": "null"}},
+        {"properties": {"action": {"const": ENVELOPE_WAIT}, "message": {"type": "null"}, "target": {"type": "null"}},
          "required": ["action", "message", "target"], "additionalProperties": False},
     ]}
 

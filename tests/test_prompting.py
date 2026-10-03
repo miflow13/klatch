@@ -158,7 +158,7 @@ def test_turn_messages_keep_room_history_inside_observed_context() -> None:
     assert "You feel rested." in turn
     assert "RELATIONSHIPS\n\n\nMEMORIES\n\n\nROOM HISTORY" in turn
     assert turn.endswith(
-        "NEXT ACTION\nGiven the room state above, choose whether you want to speak or wait. If you speak, write only what you would actually send to the room.\n"
+        "NEXT ACTION\nGiven the room state above, choose whether you want to say something or stay quiet. If you say something, write only what you would actually send to the room.\n"
     )
     assert "reserved: 0.8" not in str(messages)
     assert "curiosity: 0.8" not in str(messages)
@@ -173,7 +173,7 @@ def test_context_template_has_only_the_six_ordered_sections() -> None:
         "RELATIONSHIPS\n{relationships}\n\n"
         "MEMORIES\n{memories}\n\n"
         "ROOM HISTORY\n{room_history}\n\n"
-        "NEXT ACTION\nGiven the room state above, choose whether you want to speak or wait. If you speak, write only what you would actually send to the room.\n"
+        "NEXT ACTION\nGiven the room state above, choose whether you want to say something or stay quiet. If you say something, write only what you would actually send to the room.\n"
     )
 
 

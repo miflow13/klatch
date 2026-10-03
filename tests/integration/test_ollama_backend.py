@@ -25,7 +25,7 @@ def test_local_qwen3_returns_a_constrained_decision() -> None:
             "role": "system",
             "content": (
                 "You are June in a text room with Ada. Return one JSON decision: "
-                "speak with a nonblank message, or wait with null message and target."
+                "say something with a nonblank message, or stay quiet with null message and target."
             ),
         },
         {"role": "user", "content": "Room history: Ada said hello."},
@@ -33,6 +33,8 @@ def test_local_qwen3_returns_a_constrained_decision() -> None:
     backend = OllamaBackend(RuntimeConfig())
     result = backend.decide(agent, messages, targets=["Ada"])
     decision = result.decision
+    # The backend maps the say/quiet envelope back to the design's actions.
+    assert decision.action in {"speak", "wait"}
     if decision.action == "wait":
         assert (decision.message, decision.target) == (None, None)
     else:
