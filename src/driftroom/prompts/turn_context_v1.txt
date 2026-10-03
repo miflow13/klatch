@@ -1,0 +1,17 @@
+YOUR PERSONALITY
+{personality}
+
+CURRENT STATE
+{current_state}
+
+RELATIONSHIPS
+{relationships}
+
+MEMORIES
+{memories}
+
+ROOM HISTORY
+{room_history}
+
+NEXT ACTION
+Given the room state above, choose whether you want to say something or stay quiet. If you say something, write only what you would actually send to the room.

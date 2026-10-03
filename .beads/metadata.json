@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "driftroom",
+  "project_id": "e17cc0a2-75d9-4072-8345-b3a6976be8c1"
+}

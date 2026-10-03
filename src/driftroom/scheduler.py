@@ -1,0 +1,215 @@
+"""Cheap urge scoring before any model inference is considered."""
+
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+import re
+from random import Random
+import time
+
+from .clock import VirtualClock
+from .domain import VISIBLE_EVENT_TYPES, AgentConfig, SchedulerConfig
+from .storage import StoredEvent
+from .text import echoes_recent, token_set
+
+
+@dataclass(frozen=True)
+class CandidateScore:
+    agent_id: str
+    score: float
+    reasons: tuple[str, ...]
+
+
+class Scheduler:
+    """Score visible history using configured weights and one injected RNG stream.
+
+    Baseline talkativeness is ``1 - reserved`` and is scaled by energy and
+    attention. Missing state is neutral (1 for both, 0 for affinity).
+
+    Cooldown: an agent that spoke within ``speaker_cooldown_ms`` loses
+    ``cooldown_penalty`` with reason ``cooldown``; else one whose last failed
+    generation (``last_decision_ms``) is within ``speaker_cooldown_ms`` loses it
+    with reason ``decision_cooldown``; else one that waited (``last_wait_ms``)
+    within ``wait_cooldown_ms`` loses it with reason ``wait_cooldown``. At most
+    one cooldown penalty applies. Under the default regime the penalty (1.00)
+    outweighs the direct-mention bonus (0.55), so a mentioned agent still waits
+    out its cooldown before it is asked.
+    """
+
+    def __init__(self, config: SchedulerConfig, *, rng: Random | None = None) -> None:
+        self.config = config
+        self.rng = rng if rng is not None else Random()
+
+    def score_agents(
+        self,
+        agents: Sequence[AgentConfig],
+        events: Sequence[StoredEvent],
+        now_ms: int,
+        *,
+        energy: Mapping[str, float] | None = None,
+        attention: Mapping[str, float] | None = None,
+        relationship_affinity: Mapping[str, float] | None = None,
+        last_decision_ms: Mapping[str, int] | None = None,
+        last_wait_ms: Mapping[str, int] | None = None,
+    ) -> list[CandidateScore]:
+        visible = [event for event in events if event.type in VISIBLE_EVENT_TYPES]
+        messages = [event for event in visible if event.type == "message"]
+        # Only a message can name or echo anyone; environment text is never matched.
+        latest_message = (
+            visible[-1] if visible and visible[-1].type == "message" else None
+        )
+        latest_text = (
+            str(latest_message.payload.get("message", ""))
+            if latest_message is not None else ""
+        )
+        # Repetition (spec §36), over the messages after the last environment event
+        # (an ambient or startup line restarts both rules, so a looping room recovers):
+        # - room: the latest message echoes one of the preceding ``repetition_window``
+        #   messages, so every agent's urge to add another drops ("repetition");
+        # - self: an agent's own last message echoes one of the preceding window messages
+        #   AND is itself among the last ``repetition_window`` messages, so that agent's
+        #   urge drops further ("self_repetition") until that many fresh messages by
+        #   others have followed.
+        # A window of 1 is the pairwise room rule (a copier still gets self_repetition);
+        # both rules use the similarity threshold and damping.
+        last_environment = max(
+            (i for i, event in enumerate(visible) if event.type == "environment"),
+            default=-1,
+        )
+        recent = [event for event in visible[last_environment + 1:] if event.type == "message"]
+        recent_sets = [token_set(str(event.payload.get("message", ""))) for event in recent]
+        window = self.config.repetition_window
+        threshold = self.config.repetition_similarity_threshold
+        repeating = len(recent) >= 2 and echoes_recent(
+            len(recent) - 1, recent_sets, window, threshold
+        )
+        # Only a message can be echoed or matched; an environment event as the latest
+        # visible event leaves no latest tokens.
+        latest_tokens = recent_sets[-1] if latest_message is not None else set()
+        scores = []
+        for agent in agents:
+            score = self.config.base_bias
+            reasons: list[str] = []
+            talkativeness = (1 - agent.traits.reserved) * (
+                energy.get(agent.id, 1.0) if energy is not None else 1.0
+            ) * (attention.get(agent.id, 1.0) if attention is not None else 1.0)
+            if talkativeness and self.config.talkativeness_weight:
+                score += self.config.talkativeness_weight * talkativeness
+                reasons.append("talkativeness")
+            affinity = (
+                relationship_affinity.get(agent.id, 0.0)
+                if relationship_affinity is not None else 0.0
+            )
+            if affinity and self.config.relationship_weight:
+                score += self.config.relationship_weight * affinity
+                reasons.append("relationship")
+            if self.config.direct_mention_bonus and re.search(
+                rf"(?<!\w){re.escape(agent.name)}(?!\w)", latest_text, re.I
+            ):
+                score += self.config.direct_mention_bonus
+                reasons.append("direct_mention")
+            own_messages = [event for event in messages if event.agent_id == agent.id]
+            last_own_ms = own_messages[-1].sim_ms if own_messages else 0
+            elapsed_fraction = min(
+                1.0, max(0, now_ms - last_own_ms) / self.config.silence_ambient_after_ms
+            )
+            if elapsed_fraction and self.config.elapsed_weight:
+                score += self.config.elapsed_weight * elapsed_fraction
+                reasons.append("elapsed")
+            own_text = " ".join(
+                str(event.payload.get("message", "")) for event in own_messages[-3:]
+            )
+            own_tokens = token_set(own_text)
+            if latest_tokens and own_tokens:
+                overlap = len(latest_tokens & own_tokens) / len(latest_tokens)
+                # Overlap is relevance; echoing the room (above the threshold) is not rewarded.
+                if (
+                    overlap
+                    and overlap <= self.config.repetition_similarity_threshold
+                    and self.config.topic_overlap_weight
+                ):
+                    score += self.config.topic_overlap_weight * overlap
+                    reasons.append("topic_overlap")
+            if repeating and self.config.repetition_damping:
+                score -= self.config.repetition_damping
+                reasons.append("repetition")
+            own_recent = [i for i, event in enumerate(recent) if event.agent_id == agent.id]
+            if (
+                own_recent
+                and own_recent[-1] >= max(1, len(recent) - window)
+                and echoes_recent(own_recent[-1], recent_sets, window, threshold)
+                and self.config.repetition_damping
+            ):
+                score -= self.config.repetition_damping
+                reasons.append("self_repetition")
+            if self.config.cooldown_penalty:
+                last_decision = (
+                    last_decision_ms.get(agent.id) if last_decision_ms is not None else None
+                )
+                last_wait = last_wait_ms.get(agent.id) if last_wait_ms is not None else None
+                if own_messages and now_ms - own_messages[-1].sim_ms < self.config.speaker_cooldown_ms:
+                    score -= self.config.cooldown_penalty
+                    reasons.append("cooldown")
+                elif last_decision is not None and now_ms - last_decision < self.config.speaker_cooldown_ms:
+                    score -= self.config.cooldown_penalty
+                    reasons.append("decision_cooldown")
+                elif last_wait is not None and now_ms - last_wait < self.config.wait_cooldown_ms:
+                    score -= self.config.cooldown_penalty
+                    reasons.append("wait_cooldown")
+            if (
+                self.config.recent_speaker_penalty
+                and latest_message is not None
+                and latest_message.agent_id == agent.id
+            ):
+                score -= self.config.recent_speaker_penalty
+                reasons.append("recent_speaker")
+            if self.config.random_jitter:
+                jitter = self.rng.uniform(
+                    -self.config.random_jitter, self.config.random_jitter
+                )
+                if jitter:
+                    score += jitter
+                    reasons.append("jitter")
+            scores.append(CandidateScore(agent.id, score, tuple(reasons)))
+        return sorted(scores, key=lambda candidate: candidate.score, reverse=True)
+
+    def select_candidate(
+        self,
+        agents: Sequence[AgentConfig],
+        events: Sequence[StoredEvent],
+        now_ms: int,
+        *,
+        energy: Mapping[str, float] | None = None,
+        attention: Mapping[str, float] | None = None,
+        relationship_affinity: Mapping[str, float] | None = None,
+        last_decision_ms: Mapping[str, int] | None = None,
+        last_wait_ms: Mapping[str, int] | None = None,
+    ) -> CandidateScore | None:
+        return self.select_from(
+            self.score_agents(
+                agents,
+                events,
+                now_ms,
+                energy=energy,
+                attention=attention,
+                relationship_affinity=relationship_affinity,
+                last_decision_ms=last_decision_ms,
+                last_wait_ms=last_wait_ms,
+            )
+        )
+
+    def select_from(self, scores: Sequence[CandidateScore]) -> CandidateScore | None:
+        """Pick the top of an already scored list without drawing new jitter."""
+        if scores and scores[0].score >= self.config.candidate_threshold:
+            return scores[0]
+        return None
+
+    def wait_for_next_tick(
+        self,
+        clock: VirtualClock,
+        *,
+        sleep_fn: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if clock.mode == "realtime":
+            sleep_fn(self.config.decision_tick_ms / 1_000)
+        else:
+            clock.advance_ms(self.config.decision_tick_ms)
