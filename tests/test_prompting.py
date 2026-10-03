@@ -166,6 +166,7 @@ def test_prompt_bundle_hash_changes_with_template_bytes_and_versions(tmp_path, m
 
 
 def test_built_wheel_contains_both_prompt_templates(tmp_path) -> None:
+    pytest.importorskip("pip", reason="pip is required to build the wheel in-test")
     project = Path(__file__).resolve().parents[1]
     source = tmp_path / "source"
     source.mkdir()

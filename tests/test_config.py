@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -94,7 +95,12 @@ def test_runtime_rejects_invalid_operational_values(values: dict[str, object]) -
 
 def test_canonical_json_is_stable_and_hash_tracks_behavior_parameters() -> None:
     config = load_run_config(Path("driftroom.example.toml"))
-    assert canonical_config_json(config) == canonical_config_json(config)
+    canonical = canonical_config_json(config)
+
+    # Key order and separators: re-serializing the parsed output must be a no-op.
+    assert canonical == json.dumps(
+        json.loads(canonical), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
 
     sampling_changed = config.model_copy(deep=True)
     sampling_changed.agents[0].sampling.temperature += 0.01
@@ -105,3 +111,60 @@ def test_canonical_json_is_stable_and_hash_tracks_behavior_parameters() -> None:
     assert run_config_hash(sampling_changed) != original_hash
     assert run_config_hash(scheduler_changed) != original_hash
     assert len(original_hash) == 64
+
+
+def test_canonical_json_matches_independently_written_expected_string() -> None:
+    config = RunConfig(
+        agents=[AgentConfig(id=ident, name=ident.upper(), model="m") for ident in "abc"]
+    )
+
+    def agent(ident: str) -> str:
+        return (
+            '{"id":"' + ident + '","model":"m","name":"' + ident.upper() + '",'
+            '"sampling":{"repeat_penalty":1.08,"temperature":0.8,"top_k":40,"top_p":0.9},'
+            '"traits":{"curiosity":0.5,"formality":0.5,"humor":0.5,'
+            '"impulsiveness":0.5,"reserved":0.5}}'
+        )
+
+    expected = (
+        '{"agents":[' + ",".join(agent(ident) for ident in "abc") + "],"
+        '"runtime":{"inference_timeout_seconds":120.0,"max_output_tokens":256,'
+        '"model_thinking":false,"recent_context_events":20,"retry_count":1,'
+        '"runtime_mode":"balanced","startup_mode":"blank"},'
+        '"scheduler":{"ambient_min_interval_ms":900000,"base_bias":-0.35,'
+        '"candidate_threshold":0.35,"cooldown_penalty":1.0,"decision_tick_ms":5000,'
+        '"direct_mention_bonus":0.55,"elapsed_weight":0.3,"random_jitter":0.15,'
+        '"recent_speaker_penalty":0.45,"relationship_weight":0.1,'
+        '"silence_ambient_after_ms":300000,"speaker_cooldown_ms":20000,'
+        '"talkativeness_weight":0.45,"topic_overlap_weight":0.25}}'
+    )
+
+    assert canonical_config_json(config) == expected
+
+
+def test_toml_and_constructor_configs_hash_identically() -> None:
+    loaded = load_run_config(Path("driftroom.example.toml"))
+    built = RunConfig(
+        agents=[
+            AgentConfig(
+                model="qwen3:4b",
+                name=name,
+                id=ident,
+                traits=AgentTraits(
+                    formality=formality,
+                    impulsiveness=impulsiveness,
+                    humor=humor,
+                    curiosity=curiosity,
+                    reserved=reserved,
+                ),
+            )
+            for ident, name, reserved, curiosity, humor, impulsiveness, formality in [
+                ("june", "June", 0.7, 0.8, 0.5, 0.25, 0.2),
+                ("milo", "Milo", 0.3, 0.6, 0.8, 0.65, 0.2),
+                ("ada", "Ada", 0.5, 0.9, 0.4, 0.35, 0.6),
+            ]
+        ],
+        runtime=RuntimeConfig(inference_timeout_seconds=120),
+    )
+
+    assert run_config_hash(built) == run_config_hash(loaded)

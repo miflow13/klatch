@@ -28,7 +28,7 @@ def message(sim_ms: int) -> EventRecord:
         sim_ms=sim_ms,
         type="message",
         agent_id="june",
-        payload={"text": f"message {sim_ms}"},
+        payload={"speaker": "June", "message": f"message {sim_ms}"},
     )
 
 
@@ -62,7 +62,7 @@ def test_event_ids_persist_and_cursor_returns_only_later_events(tmp_path) -> Non
     reopened = EventStore(path)
     reopened.initialize()
     assert reopened.get_run(run.run_id) == run
-    assert [(event.id, event.payload["text"]) for event in reopened.read_events(run.run_id)] == [
+    assert [(event.id, event.payload["message"]) for event in reopened.read_events(run.run_id)] == [
         (first, "message 100"),
         (second, "message 200"),
     ]
