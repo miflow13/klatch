@@ -52,6 +52,11 @@ class DecisionValidationError(BackendError):
     """The model returned content that violates the decision schema."""
 
 
+class TruncatedGenerationError(DecisionValidationError):
+    """Generation hit the configured output-token limit (``num_predict``)
+    before completing the decision envelope."""
+
+
 class EmptyModelContentError(BackendError):
     """The model response contained no decision content."""
 

@@ -12,7 +12,7 @@ from driftroom.models.ollama_backend import OllamaBackend
 def test_local_qwen3_returns_a_constrained_decision() -> None:
     try:
         installed = ollama.Client(timeout=2).list()
-    except (httpx.HTTPError, ollama.ResponseError, ConnectionError) as exc:
+    except (httpx.HTTPError, ollama.ResponseError, ConnectionError, ValueError) as exc:
         pytest.skip(f"local Ollama unavailable: {exc}")
 
     names = {model.model for model in installed.models}

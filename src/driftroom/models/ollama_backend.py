@@ -19,6 +19,7 @@ from .base import (
     ModelBackend,
     ModelInfo,
     ModelResult,
+    TruncatedGenerationError,
 )
 
 
@@ -35,7 +36,7 @@ def _call(operation: str, request: Callable[[], _T]) -> _T:
     """Run one client request, mapping transport failures to backend errors."""
     try:
         return request()
-    except (TimeoutError, httpx.TimeoutException) as exc:
+    except (TimeoutError, httpx.ReadTimeout) as exc:
         raise BackendTimeoutError(f"Ollama {operation} timed out") from exc
     except ollama.ResponseError as exc:
         raise BackendError(
@@ -83,6 +84,13 @@ class OllamaBackend(ModelBackend):
                 },
             ),
         )
+
+        # A length-cut envelope is not a trustworthy decision, even if it parses.
+        if _field(response, "done_reason") == "length":
+            raise TruncatedGenerationError(
+                "Ollama hit the output-token limit (max_output_tokens="
+                f"{self._runtime.max_output_tokens}) before completing the decision"
+            )
 
         content = _field(_field(response, "message"), "content")
         if not isinstance(content, str) or not content.strip():

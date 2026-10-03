@@ -14,6 +14,7 @@ from driftroom.models.base import (
     DecisionValidationError,
     EmptyModelContentError,
     ModelInfo,
+    TruncatedGenerationError,
 )
 from driftroom.models.fake import FakeModelBackend
 from driftroom.models.ollama_backend import OllamaBackend
@@ -63,10 +64,10 @@ def backend(client: RecordingClient) -> OllamaBackend:
     return OllamaBackend(RUNTIME, client=client)
 
 
-def response(content: str) -> dict[str, object]:
+def response(content: str, done_reason: str | None = None) -> dict[str, object]:
     # "digest" is not part of Ollama's chat response; it is planted here to
     # prove decide() does not invent a model digest from the chat payload.
-    return {
+    payload: dict[str, object] = {
         "model": "qwen3:4b",
         "digest": "sha256:planted",
         "message": {"role": "assistant", "content": content},
@@ -75,6 +76,9 @@ def response(content: str) -> dict[str, object]:
         "prompt_eval_count": 12,
         "eval_count": 4,
     }
+    if done_reason is not None:
+        payload["done_reason"] = done_reason
+    return payload
 
 
 @pytest.mark.parametrize("message", [None, "", " \t\n"])
@@ -218,14 +222,70 @@ def test_httpx_timeout_raises_distinct_error() -> None:
     assert len(client.calls) == 1
 
 
-def test_httpx_connect_error_raises_backend_error() -> None:
-    error = httpx.ConnectError("refused")
+@pytest.mark.parametrize(
+    "error", [httpx.ConnectError("refused"), ConnectionError("refused")]
+)
+def test_connection_refused_raises_backend_error_not_timeout(
+    error: Exception,
+) -> None:
+    # httpx.ConnectError is what raw httpx raises; the real ollama.Client
+    # converts it to the builtin ConnectionError.
     client = RecordingClient(error=error)
     with pytest.raises(BackendError) as caught:
         backend(client).decide(AGENT, MESSAGES)
     assert type(caught.value) is BackendError
+    assert not isinstance(caught.value, BackendTimeoutError)
     assert caught.value.__cause__ is error
     assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ConnectTimeout("no route"),
+        httpx.PoolTimeout("pool exhausted"),
+        httpx.WriteTimeout("stalled upload"),
+    ],
+)
+def test_non_read_httpx_timeouts_are_network_errors(error: Exception) -> None:
+    client = RecordingClient(error=error)
+    with pytest.raises(BackendError) as caught:
+        backend(client).decide(AGENT, MESSAGES)
+    assert type(caught.value) is BackendError
+    assert not isinstance(caught.value, BackendTimeoutError)
+    assert caught.value.__cause__ is error
+    assert len(client.calls) == 1
+
+
+def test_length_cutoff_with_partial_json_raises_truncated_error() -> None:
+    client = RecordingClient(response('{"action":"speak","mess', done_reason="length"))
+    with pytest.raises(TruncatedGenerationError) as caught:
+        backend(client).decide(AGENT, MESSAGES)
+    assert isinstance(caught.value, DecisionValidationError)
+    assert isinstance(caught.value, BackendError)
+    assert "max_output_tokens" in str(caught.value)
+    assert len(client.calls) == 1
+
+
+def test_length_cutoff_with_complete_json_is_still_truncated() -> None:
+    content = '{"action":"wait","message":null,"target":null}'
+    client = RecordingClient(response(content, done_reason="length"))
+    with pytest.raises(TruncatedGenerationError):
+        backend(client).decide(AGENT, MESSAGES)
+    assert len(client.calls) == 1
+
+
+def test_length_cutoff_with_empty_content_is_truncated_not_empty() -> None:
+    client = RecordingClient(response("", done_reason="length"))
+    with pytest.raises(TruncatedGenerationError):
+        backend(client).decide(AGENT, MESSAGES)
+
+
+def test_stop_reason_with_valid_json_succeeds() -> None:
+    content = '{"action":"wait","message":null,"target":null}'
+    client = RecordingClient(response(content, done_reason="stop"))
+    result = backend(client).decide(AGENT, MESSAGES)
+    assert result.decision.action == "wait"
 
 
 def test_default_client_uses_host_and_configured_timeout(
@@ -292,11 +352,11 @@ def test_model_info_maps_transport_failures(
 
 def test_fake_backend_consumes_decisions_and_exceptions_in_order() -> None:
     decision = Decision(action="wait", message=None, target=None)
-    backend = FakeModelBackend([decision, BackendTimeoutError("late")])
-    result = backend.decide(AGENT, MESSAGES)
+    fake = FakeModelBackend([decision, BackendTimeoutError("late")])
+    result = fake.decide(AGENT, MESSAGES)
     assert result.decision is decision
     assert result.model == "qwen3:4b"
     with pytest.raises(BackendTimeoutError):
-        backend.decide(AGENT, MESSAGES)
+        fake.decide(AGENT, MESSAGES)
     with pytest.raises(BackendError):
-        backend.decide(AGENT, MESSAGES)
+        fake.decide(AGENT, MESSAGES)
