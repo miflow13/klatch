@@ -139,6 +139,14 @@ def test_empty_run_has_zero_counts_and_no_inference_mean(store) -> None:
     )
 
 
+def test_the_startup_line_is_not_counted_as_an_ambient_event(store) -> None:
+    add(store, "session_started", 0)
+    add(store, "environment", 0, {"text": "June, Milo and Ada are in the room", "kind": "startup"})
+    add(store, "environment", SILENCE_MS, {"text": "the room has been quiet for a while"})
+
+    assert analyze_run(store, "run-1").ambient_events == 1
+
+
 def test_unknown_run_is_an_error(store) -> None:
     with pytest.raises(KeyError, match="run-x"):
         analyze_run(store, "run-x")

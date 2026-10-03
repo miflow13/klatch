@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import re
 from statistics import fmean, median
 
-from .domain import VISIBLE_EVENT_TYPES
+from .domain import VISIBLE_EVENT_TYPES, is_ambient_event
 from .storage import EventStore, StoredEvent
 
 
@@ -117,7 +117,11 @@ def analyze_run(store: EventStore, run_id: str) -> RunMetrics:
         assistant_phrase_hits=sum(len(p.findall(text)) for p in _ASSISTANT_PATTERNS for text in texts),
         as_an_ai_hits=sum(len(_AS_AN_AI.findall(text)) for text in texts),
         silence_periods=_silence_periods(events, run.config.scheduler.silence_ambient_after_ms),
-        ambient_events=len(by_type.get("environment", [])),
+        # Ambient silence events only; the startup line of environment/topic mode is
+        # visible room activity but not an ambient event (payload "kind": "startup").
+        ambient_events=sum(
+            1 for event in by_type.get("environment", []) if is_ambient_event(event.type, event.payload)
+        ),
         mean_inference_ms=fmean(latencies) if latencies else None,
         failure_classes=dict(Counter(str(event.payload["error_class"]) for event in attempt_failures)),
         decisions_per_sim_minute=decisions / (span_ms / 60_000) if span_ms > 0 else 0.0,

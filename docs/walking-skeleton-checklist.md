@@ -51,6 +51,25 @@ driftroom start --db room.sqlite3 --config driftroom.example.toml
 >   `target` limited to the other participants' display names (or null), WAIT carries null
 >   message and target. It is part of the recorded regime via `engine_version`
 >   (`driftroom-engine-0.1.1` introduced it).
+> - `runtime.startup_mode` selects what a **fresh** start writes, right after
+>   `session_started` and at the same simulated time; a restart writes nothing extra:
+>   - `blank` (the spec default): nothing. The first prompt's ROOM HISTORY reads
+>     `(no messages yet)`.
+>   - `environment`: one environment line naming who is in the room, in config order, e.g.
+>     `[00:00] (June, Milo and Ada are in the room)`.
+>   - `topic`: one environment line `the room was opened with the topic: <topic>`, with
+>     `runtime.topic` set (it is required in this mode and rejected in the others).
+>   - `custom` is reserved and rejected in v0.1.
+>
+>   The startup line is descriptive, never an instruction, and is stored with payload
+>   `{"text": ..., "kind": "startup"}`. It is visible room activity but not an ambient
+>   event: it does not delay the first "quiet for a while" line and is not counted in
+>   `ambient_events` by `analyze_run` (the `status` command's "ambient events" line still
+>   counts every environment event). An empty transcript renders as `(no messages yet)`
+>   (`room-transcript-v2`, `driftroom-engine-0.1.2`).
+> - Recommendation: run this gate once in `blank` and once in `environment` mode and record
+>   both verdicts. Both are legitimate regimes; the comparison between them is the finding
+>   (on the first real runs, an empty `blank` room produced only WAITs).
 
 ## 1. Prerequisites
 
@@ -144,8 +163,8 @@ Copy from the run's `session_started` event(s) in the jsonl export.
 - `trait_renderer_version`: ______________________
 - `config_hash`: ______________________
 
-Note: the `room-transcript-v1` turn format is frozen from the first recorded run. Any later
-change to how the room transcript is rendered must bump `TURN_FORMAT_VERSION`.
+Note: the `room-transcript-v2` turn format is frozen from the first accepted gate run. Any
+later change to how the room transcript is rendered must bump `TURN_FORMAT_VERSION`.
 
 ## 6. Gate decision
 

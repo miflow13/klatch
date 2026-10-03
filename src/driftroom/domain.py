@@ -1,13 +1,24 @@
 """Validated domain configuration models for a Driftroom run."""
 
-from typing import Literal
+from collections.abc import Mapping
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel, ConfigDict, Field, ModelWrapValidatorHandler, field_validator, model_validator,
+)
 
 
 # Event types that participants can see; "environment" events are neutral,
-# unattributed room descriptions with payload {"text": ...}.
+# unattributed room descriptions. An ambient silence event (§14) has payload
+# {"text": ...}; the startup line of the environment and topic modes (§9) has
+# {"text": ..., "kind": "startup"}. Both are visible; only payloads without a
+# "kind" key are ambient events for ambient throttling and the ambient metric.
 VISIBLE_EVENT_TYPES: frozenset[str] = frozenset({"message", "environment"})
+
+
+def is_ambient_event(event_type: str, payload: Mapping[str, object]) -> bool:
+    """True for an ambient silence event, false for a startup line or any other event."""
+    return event_type == "environment" and "kind" not in payload
 
 
 class StrictModel(BaseModel):
@@ -58,7 +69,10 @@ class SchedulerConfig(StrictModel):
 
 
 class RuntimeConfig(StrictModel):
+    # "custom" stays in the Literal so choosing it gets a specific error (spec §9).
     startup_mode: Literal["blank", "topic", "environment", "custom"] = "blank"
+    # Required by, and only allowed with, startup_mode="topic".
+    topic: str | None = None
     runtime_mode: Literal["eco", "balanced", "fast"] = "balanced"
     model_thinking: bool = False
     recent_context_events: int = Field(default=20, ge=0)
@@ -78,6 +92,43 @@ class RuntimeConfig(StrictModel):
         if value:
             raise ValueError("v0.1 requires model_thinking=false")
         return value
+
+    @field_validator("startup_mode")
+    @classmethod
+    def custom_startup_mode_is_reserved(cls, value: str) -> str:
+        if value == "custom":
+            raise ValueError("custom startup mode is reserved and not available in v0.1")
+        return value
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def topic_matches_startup_mode(
+        cls, data: Any, handler: ModelWrapValidatorHandler["RuntimeConfig"]
+    ) -> "RuntimeConfig":
+        # On assignment ``data`` is the instance, already updated in place by the
+        # handler; restore it when the combination is rejected, so a rejected
+        # assignment leaves the object unchanged (as the field validators do).
+        snapshot = (
+            (dict(data.__dict__), set(data.__pydantic_fields_set__))
+            if isinstance(data, RuntimeConfig) else None
+        )
+        result = handler(data)
+        try:
+            if result.startup_mode == "topic":
+                if result.topic is None or not result.topic.strip():
+                    raise ValueError("topic startup mode requires a nonblank topic")
+            elif result.topic is not None:
+                raise ValueError(
+                    f"topic is only allowed with startup_mode='topic', not {result.startup_mode!r}"
+                )
+        except ValueError:
+            if snapshot is not None:
+                data.__dict__.clear()
+                data.__dict__.update(snapshot[0])
+                data.__pydantic_fields_set__.clear()
+                data.__pydantic_fields_set__.update(snapshot[1])
+            raise
+        return result
 
 
 class RunConfig(StrictModel):

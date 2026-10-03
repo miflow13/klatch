@@ -26,6 +26,7 @@ def test_configuration_defaults() -> None:
     assert SamplingConfig().top_k == 40
     assert SamplingConfig().repeat_penalty == 1.08
     assert RuntimeConfig().startup_mode == "blank"
+    assert RuntimeConfig().topic is None
     assert RuntimeConfig().runtime_mode == "balanced"
     assert RuntimeConfig().model_thinking is False
     assert RuntimeConfig().random_seed is None
@@ -123,6 +124,42 @@ def test_rejected_model_thinking_assignment_leaves_value_unchanged() -> None:
     assert config.runtime.model_thinking is False
 
 
+def test_topic_mode_requires_a_nonblank_topic() -> None:
+    assert RuntimeConfig(startup_mode="topic", topic="rain on the roof").topic == "rain on the roof"
+    for missing in ({}, {"topic": ""}, {"topic": "  \n\t"}):
+        with pytest.raises(ValidationError, match="topic startup mode requires a nonblank topic"):
+            RuntimeConfig(startup_mode="topic", **missing)
+
+
+@pytest.mark.parametrize("mode", ["blank", "environment"])
+def test_a_topic_is_rejected_outside_topic_mode(mode: str) -> None:
+    assert RuntimeConfig(startup_mode=mode).topic is None
+    with pytest.raises(ValidationError, match=f"topic is only allowed with startup_mode='topic', not {mode!r}"):
+        RuntimeConfig(startup_mode=mode, topic="rain on the roof")
+
+
+def test_custom_startup_mode_is_reserved() -> None:
+    with pytest.raises(ValidationError, match="custom startup mode is reserved and not available in v0.1"):
+        RuntimeConfig(startup_mode="custom")
+
+
+def test_rejected_startup_assignments_leave_the_runtime_unchanged() -> None:
+    runtime = RuntimeConfig()
+    with pytest.raises(ValidationError, match="requires a nonblank topic"):
+        runtime.startup_mode = "topic"
+    with pytest.raises(ValidationError, match="only allowed with startup_mode='topic'"):
+        runtime.topic = "rain"
+    with pytest.raises(ValidationError, match="reserved"):
+        runtime.startup_mode = "custom"
+    assert (runtime.startup_mode, runtime.topic) == ("blank", None)
+    assert runtime == RuntimeConfig()
+
+    topical = RuntimeConfig(startup_mode="topic", topic="rain")
+    with pytest.raises(ValidationError, match="requires a nonblank topic"):
+        topical.topic = None
+    assert (topical.startup_mode, topical.topic) == ("topic", "rain")
+
+
 def test_canonical_json_is_canonically_ordered_and_hash_tracks_behavior_parameters() -> None:
     config = load_run_config(Path("driftroom.example.toml"))
     canonical = canonical_config_json(config)
@@ -162,7 +199,7 @@ def test_canonical_json_matches_independently_written_expected_string() -> None:
         '"inference_timeout_seconds":120.0,"max_context_tokens":8192,'
         '"max_output_tokens":256,"model_thinking":false,"random_seed":null,'
         '"recent_context_events":20,"retry_count":1,'
-        '"runtime_mode":"balanced","startup_mode":"blank"},'
+        '"runtime_mode":"balanced","startup_mode":"blank","topic":null},'
         '"scheduler":{"ambient_min_interval_ms":900000,"base_bias":-0.35,'
         '"candidate_threshold":0.2,"cooldown_penalty":1.0,"decision_tick_ms":5000,'
         '"direct_mention_bonus":0.55,"elapsed_weight":0.3,"random_jitter":0.15,'
@@ -237,7 +274,7 @@ def test_run_fingerprint_defaults_engine_version_constant() -> None:
         config, prompt_hash="p", model_digests=digests, engine_version=ENGINE_VERSION
     )
 
-    assert ENGINE_VERSION == "driftroom-engine-0.1.1"
+    assert ENGINE_VERSION == "driftroom-engine-0.1.2"
     assert run_fingerprint(config, prompt_hash="p", model_digests=digests) == explicit
 
 
@@ -304,6 +341,20 @@ def _with(mutate: Callable[[RunConfig], None]) -> RunConfig:
                 _with(lambda c: setattr(c.runtime, "max_context_tokens", 4096))
             ),
             id="max_context_tokens",
+        ),
+        pytest.param(
+            lambda: _baseline_fingerprint(
+                _with(lambda c: setattr(c, "runtime", c.runtime.model_copy(
+                    update={"startup_mode": "topic", "topic": "rain"}
+                )))
+            ),
+            id="topic",
+        ),
+        pytest.param(
+            lambda: _baseline_fingerprint(
+                _with(lambda c: setattr(c.runtime, "startup_mode", "environment"))
+            ),
+            id="startup_mode",
         ),
         pytest.param(lambda: _baseline_fingerprint(prompt_hash="q" * 64), id="prompt_hash"),
         pytest.param(

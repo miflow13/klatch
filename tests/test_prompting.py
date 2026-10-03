@@ -120,6 +120,26 @@ def test_environment_events_render_as_neutral_unattributed_room_lines() -> None:
         "[00:05] (the room has been quiet for a while)"
     )
 
+def test_an_empty_room_renders_an_explicit_no_messages_line() -> None:
+    prompting = importlib.import_module("driftroom.prompting")
+    wait = StoredEvent(1, "run-1", "2026-10-01T12:00:00Z", 0, "agent_wait", "june", {})
+    started = StoredEvent(0, "run-1", "2026-10-01T12:00:00Z", 0, "session_started", None, {})
+    assert prompting.render_room_history([], now_sim_ms=0) == "(no messages yet)"
+    # Only visible events count, and an empty room has no gap to mark as silence.
+    assert prompting.render_room_history([started, wait], now_sim_ms=3_600_000) == "(no messages yet)"
+
+
+def test_an_empty_room_turn_shows_no_messages_yet_under_room_history() -> None:
+    prompting = importlib.import_module("driftroom.prompting")
+    turn = prompting.build_turn_messages(prompting.TurnContext(agent(), [], 0))[1]["content"]
+    assert "ROOM HISTORY\n(no messages yet)\n\nNEXT ACTION" in turn
+
+
+def test_turn_format_version_is_v2() -> None:
+    prompting = importlib.import_module("driftroom.prompting")
+    assert prompting.TURN_FORMAT_VERSION == "room-transcript-v2"
+
+
 def test_turn_messages_keep_room_history_inside_observed_context() -> None:
     prompting = importlib.import_module("driftroom.prompting")
     context = prompting.TurnContext(
@@ -176,7 +196,7 @@ def test_prompt_bundle_hash_changes_with_template_bytes_and_versions(tmp_path, m
     monkeypatch.setattr(prompting, "TRAIT_RENDERER_VERSION", "traits-v2")
     assert prompting.prompt_template_hash() != baseline
     monkeypatch.setattr(prompting, "TRAIT_RENDERER_VERSION", "traits-v1")
-    monkeypatch.setattr(prompting, "TURN_FORMAT_VERSION", "room-transcript-v2")
+    monkeypatch.setattr(prompting, "TURN_FORMAT_VERSION", "room-transcript-v3")
     assert prompting.prompt_template_hash() != baseline
 
 

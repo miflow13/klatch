@@ -15,7 +15,7 @@ from typing import Literal
 
 from .clock import VirtualClock
 from .config import ENGINE_VERSION, run_config_hash, run_fingerprint
-from .domain import VISIBLE_EVENT_TYPES, RunConfig
+from .domain import VISIBLE_EVENT_TYPES, RunConfig, is_ambient_event
 from .models.base import BackendError, Decision, DecisionValidationError, ModelBackend, raw_excerpt
 from .prompting import (
     TRAIT_RENDERER_VERSION, TURN_FORMAT_VERSION, TurnContext, build_turn_messages, prompt_template_hash,
@@ -26,6 +26,13 @@ from .storage import EventRecord, EventStore, RunRecord, StoredEvent
 
 # Neutral and descriptive, never directive: it opens an opportunity, not a turn (§14).
 AMBIENT_SILENCE_TEXT = "the room has been quiet for a while"
+
+
+def room_presence_text(names: Sequence[str]) -> str:
+    """Who is in the room, in configuration order: an observer's description (§26)."""
+    if len(names) == 1:
+        return f"{names[0]} is in the room"
+    return f"{', '.join(names[:-1])} and {names[-1]} are in the room"
 
 
 @dataclass(frozen=True)
@@ -114,7 +121,7 @@ class SimulationEngine:
             self._remember_decision(event.type, event.agent_id, event.sim_ms)
         prompt_hash = self._prompt_hash = prompt_template_hash()
         self._sim_start_ms = self.clock.now_ms()
-        return self._commit("session_started", None, self._sim_start_ms, {
+        started_id = self._commit("session_started", None, self._sim_start_ms, {
             "run_fingerprint": run_fingerprint(
                 self.config, prompt_hash=prompt_hash, model_digests=self.model_digests
             ),
@@ -133,6 +140,21 @@ class SimulationEngine:
             "sim_start_ms": self._sim_start_ms,
             "restart": restart,
         })
+        if not restart:
+            self._commit_startup_line()
+        return started_id
+
+    def _commit_startup_line(self) -> None:
+        # Fresh start only: a restart gets no second opening line (§25). The line
+        # describes the room, never asks anything of it (§14, §33); blank adds nothing.
+        runtime = self.config.runtime
+        if runtime.startup_mode == "environment":
+            text = room_presence_text([agent.name for agent in self.config.agents])
+        elif runtime.startup_mode == "topic":
+            text = f"the room was opened with the topic: {runtime.topic}"
+        else:
+            return
+        self._commit("environment", None, self._sim_start_ms, {"text": text, "kind": "startup"})
 
     def step(self) -> EngineStepResult:
         if self._sim_start_ms is None:
@@ -235,7 +257,7 @@ class SimulationEngine:
         # times committed this session remain as a fallback.
         scheduler = self.config.scheduler
         visible = [event.sim_ms for event in recent if event.type in VISIBLE_EVENT_TYPES]
-        ambient = [event.sim_ms for event in recent if event.type == "environment"]
+        ambient = [event.sim_ms for event in recent if is_ambient_event(event.type, event.payload)]
         last_visible_ms = _latest(self._sim_start_ms, *visible[-1:], self._last_visible_ms)
         last_ambient_ms = _latest(*ambient[-1:], self._last_ambient_ms)
         assert last_visible_ms is not None
@@ -303,7 +325,7 @@ class SimulationEngine:
         event_id = self.store.commit_event(record)
         if event_type in VISIBLE_EVENT_TYPES:
             self._last_visible_ms = sim_ms
-        if event_type == "environment":
+        if is_ambient_event(event_type, payload):
             self._last_ambient_ms = sim_ms
         self._remember_decision(event_type, agent_id, sim_ms)
         return StoredEvent(

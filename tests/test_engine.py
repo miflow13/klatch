@@ -12,7 +12,7 @@ import pytest
 from driftroom.clock import VirtualClock
 from driftroom.config import ENGINE_VERSION, load_run_config, run_config_hash, run_fingerprint
 from driftroom.domain import AgentConfig, RunConfig
-from driftroom.engine import EngineStepResult, SimulationEngine
+from driftroom.engine import EngineStepResult, SimulationEngine, room_presence_text
 from driftroom.models.base import (
     BackendTimeoutError, Decision, DecisionValidationError, EmptyModelContentError,
     ModelBackend, ModelResult, decision_schema,
@@ -451,6 +451,114 @@ def test_run_calls_on_step_once_per_step_up_to_max_steps(tmp_path) -> None:
     engine.run(5, on_step=seen.append)
 
     assert [result.kind for result in seen] == ["idle"] * 5
+
+
+# --- startup modes (spec §9, §26) --------------------------------------------
+
+def topic_config(topic: str, scheduler: dict[str, Any] | None = None) -> RunConfig:
+    return make_config(scheduler, startup_mode="topic", topic=topic)
+
+
+@pytest.mark.parametrize(("names", "text"), [
+    (["June"], "June is in the room"),
+    (["June", "Milo"], "June and Milo are in the room"),
+    (["June", "Milo", "Ada"], "June, Milo and Ada are in the room"),
+    (["June", "Milo", "Ada", "Atlas"], "June, Milo, Ada and Atlas are in the room"),
+])
+def test_room_presence_text_names_everyone_in_order(names: list[str], text: str) -> None:
+    assert room_presence_text(names) == text
+
+
+def test_environment_mode_opens_with_one_presence_line_before_any_decision(tmp_path) -> None:
+    seen: list[StoredEvent] = []
+    backend = RecordingBackend([WAIT])
+    config = make_config(FORCED, startup_mode="environment")
+    engine, store, _ = make_engine(tmp_path, config, backend, observer=seen.append)
+
+    started_id = engine.start()
+
+    started, opening = events(store)
+    assert (started.id, started.type) == (started_id, "session_started")
+    assert started.payload["startup_mode"] == "environment"
+    assert (opening.type, opening.agent_id, opening.sim_ms) == ("environment", None, started.sim_ms)
+    assert opening.payload == {"text": "June, Milo and Ada are in the room", "kind": "startup"}
+    assert seen == [started, opening]
+    assert backend.calls == []
+
+    assert engine.step().kind == "wait"
+    assert "ROOM HISTORY\n[00:00] (June, Milo and Ada are in the room)\n\nNEXT ACTION" in history(
+        backend.calls[0][1]
+    )
+
+
+def test_topic_mode_opens_with_the_topic_as_an_environment_line(tmp_path) -> None:
+    backend = RecordingBackend([WAIT])
+    engine, store, _ = make_engine(tmp_path, topic_config("rain on the roof", FORCED), backend)
+    engine.start()
+
+    started, opening = events(store)
+    assert started.payload["startup_mode"] == "topic"
+    assert (opening.type, opening.agent_id, opening.sim_ms) == ("environment", None, started.sim_ms)
+    assert opening.payload == {"text": "the room was opened with the topic: rain on the roof", "kind": "startup"}
+    engine.step()
+    assert "[00:00] (the room was opened with the topic: rain on the roof)" in history(backend.calls[0][1])
+
+
+def test_blank_mode_writes_nothing_and_the_first_prompt_says_no_messages_yet(tmp_path) -> None:
+    backend = RecordingBackend([WAIT])
+    engine, store, _ = make_engine(tmp_path, make_config(FORCED), backend)
+    engine.start()
+
+    assert types(store) == ["session_started"]
+    engine.step()
+    assert "ROOM HISTORY\n(no messages yet)\n\nNEXT ACTION" in history(backend.calls[0][1])
+
+
+@pytest.mark.parametrize("config", [
+    pytest.param(make_config(UNREACHABLE, startup_mode="environment"), id="environment"),
+    pytest.param(topic_config("rain", UNREACHABLE), id="topic"),
+])
+def test_a_restart_writes_no_second_startup_line(tmp_path, config: RunConfig) -> None:
+    path = tmp_path / "room.sqlite3"
+    store = open_store(path)
+    store.initialize()
+    first = SimulationEngine(
+        config, store, RecordingBackend([]), run_id="run-1", room_id="room-1",
+        wall_clock=lambda: WALL, sleep_fn=forbidden_sleep,
+    )
+    first.start()
+    first.step()
+    first.stop()
+    second = SimulationEngine(
+        config, store, RecordingBackend([]), run_id="run-1", room_id="room-1",
+        wall_clock=lambda: WALL, sleep_fn=forbidden_sleep,
+    )
+    second.start()
+
+    assert types(store) == ["session_started", "environment", "session_ended", "session_started"]
+    assert events(store)[-1].payload["restart"] is True
+
+
+@pytest.mark.parametrize("config", [
+    pytest.param(make_config, id="blank"),
+    pytest.param(lambda scheduler: make_config(scheduler, startup_mode="environment"), id="environment"),
+    pytest.param(lambda scheduler: topic_config("rain", scheduler), id="topic"),
+])
+def test_the_startup_line_is_visible_but_does_not_throttle_silence_ambience(tmp_path, config) -> None:
+    # The opening line is room activity at the start, like session_started itself;
+    # it is not an ambient silence event, so silence ambience keeps the blank-mode
+    # schedule and only the opening line differs between startup modes.
+    scheduler = {
+        **UNREACHABLE, "decision_tick_ms": 1_000, "silence_ambient_after_ms": 5_000,
+        "ambient_min_interval_ms": 12_000,
+    }
+    engine, store, _ = make_engine(tmp_path, config(scheduler), RecordingBackend([]))
+    engine.start()
+    for _ in range(40):
+        engine.step()
+
+    silence = [event for event in events(store) if event.type == "environment" and "kind" not in event.payload]
+    assert [event.sim_ms for event in silence] == [5_000, 17_000, 29_000]
 
 
 # --- control, time, ambient, restart -----------------------------------------

@@ -52,7 +52,8 @@ speaker_cooldown_ms = 20000
 wait_cooldown_ms = 90000
 
 [runtime]
-startup_mode = "blank"
+startup_mode = "blank"  # blank | environment | topic ("custom" is reserved)
+# topic = "..."  # required with startup_mode = "topic"; leave unset otherwise
 runtime_mode = "balanced"
 model_thinking = false
 recent_context_events = 20

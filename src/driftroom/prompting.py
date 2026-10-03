@@ -10,10 +10,12 @@ from .storage import StoredEvent
 
 
 TRAIT_RENDERER_VERSION = "traits-v1"
-# No run has been recorded under this version yet, so the continuation-line indent
-# (R9) joined it without a bump. That was the last change allowed before the freeze:
-# any further change to the transcript format must bump this version.
-TURN_FORMAT_VERSION = "room-transcript-v1"
+# v1 was frozen at the first recorded run. v2 renders an empty room as
+# "(no messages yet)" instead of a blank ROOM HISTORY section. v2 frozen from the
+# first accepted gate run: any further change to the transcript format must bump
+# this version.
+TURN_FORMAT_VERSION = "room-transcript-v2"
+EMPTY_ROOM_HISTORY = "(no messages yet)"
 _PROMPTS = Path(__file__).resolve().parent / "prompts"
 
 _TRAIT_PHRASES = {
@@ -68,6 +70,8 @@ def render_room_history(events: Sequence[StoredEvent], now_sim_ms: int) -> str:
     coarse silence cues measure gaps between any visible events. Continuation
     lines of a text are indented under the stamp, so text can never start a
     transcript line and pass as another speaker; the stored text is unchanged.
+    A room with no visible events renders as an explicit "(no messages yet)",
+    never as an empty section.
     """
     lines: list[str] = []
     last_visible_ms: int | None = None
@@ -91,7 +95,7 @@ def render_room_history(events: Sequence[StoredEvent], now_sim_ms: int) -> str:
     if last_visible_ms is not None and now_sim_ms - last_visible_ms >= 300_000:
         minutes = round((now_sim_ms - last_visible_ms) / 60_000)
         lines.append(f"[about {minutes} minutes later]")
-    return "\n".join(lines)
+    return "\n".join(lines) if lines else EMPTY_ROOM_HISTORY
 
 
 @dataclass(frozen=True)
