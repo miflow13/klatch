@@ -71,6 +71,11 @@ _STATE_COLUMNS = {
 }
 
 
+def _stored_event(row: sqlite3.Row) -> StoredEvent:
+    return StoredEvent(row["id"], row["run_id"], row["wall_ts"], row["sim_ms"],
+                       row["type"], row["agent_id"], json.loads(row["payload_json"]))
+
+
 class EventStore:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -233,11 +238,17 @@ class EventStore:
             "SELECT * FROM events WHERE run_id=? AND id>? ORDER BY id LIMIT ?",
             (run_id, after_id, limit),
         ).fetchall()
-        return [
-            StoredEvent(row["id"], row["run_id"], row["wall_ts"], row["sim_ms"],
-                        row["type"], row["agent_id"], json.loads(row["payload_json"]))
-            for row in rows
-        ]
+        return [_stored_event(row) for row in rows]
+
+    def read_recent_events(self, run_id: str, limit: int) -> list[StoredEvent]:
+        """Return the last ``limit`` events of a run, oldest first."""
+        if limit < 0:
+            raise ValueError("limit cannot be negative")
+        rows = self._db.execute(
+            "SELECT * FROM events WHERE run_id=? ORDER BY id DESC LIMIT ?",
+            (run_id, limit),
+        ).fetchall()
+        return [_stored_event(row) for row in reversed(rows)]
 
     def set_control(self, room_id: str, desired_state: DesiredState) -> None:
         if desired_state not in ("running", "paused", "stop_requested"):

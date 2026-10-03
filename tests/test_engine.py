@@ -1,0 +1,424 @@
+"""The walking-skeleton engine composes store, clock, scheduler, prompts, and model."""
+
+from collections import deque
+from collections.abc import Callable, Sequence
+from datetime import datetime, timezone
+from pathlib import Path
+import re
+from typing import Any
+
+import pytest
+
+from driftroom.clock import VirtualClock
+from driftroom.config import ENGINE_VERSION, load_run_config, run_config_hash, run_fingerprint
+from driftroom.domain import AgentConfig, RunConfig
+from driftroom.engine import EngineStepResult, SimulationEngine
+from driftroom.models.base import (
+    BackendTimeoutError, Decision, DecisionValidationError, EmptyModelContentError,
+    ModelBackend, ModelResult,
+)
+from driftroom.models.fake import FakeModelBackend
+from driftroom.prompting import TRAIT_RENDERER_VERSION, TURN_FORMAT_VERSION, prompt_template_hash
+from driftroom.storage import EventRecord, EventStore, StoredEvent
+
+
+EXAMPLE_CONFIG = Path(__file__).resolve().parents[1] / "driftroom.example.toml"
+WALL = datetime(2026, 10, 1, 12, tzinfo=timezone.utc)
+WAIT = Decision(action="wait", message=None, target=None)
+# Every agent scores exactly base_bias, so the first configured agent is always selected.
+FORCED = dict(
+    base_bias=1.0, talkativeness_weight=0, direct_mention_bonus=0, topic_overlap_weight=0,
+    elapsed_weight=0, relationship_weight=0, recent_speaker_penalty=0, cooldown_penalty=0,
+    random_jitter=0,
+)
+UNREACHABLE = {**FORCED, "base_bias": -1.0}
+
+
+def speak(text: str, target: str | None = None) -> Decision:
+    return Decision(action="speak", message=text, target=target)
+
+
+def make_config(scheduler: dict[str, Any] | None = None, **runtime: Any) -> RunConfig:
+    data = load_run_config(EXAMPLE_CONFIG).model_dump(mode="json")
+    data["runtime"].update({"clock_mode": "accelerated", "random_seed": 7, **runtime})
+    data["scheduler"].update(scheduler or {})
+    return RunConfig.model_validate(data)
+
+
+def forbidden_sleep(seconds: float) -> None:
+    raise AssertionError(f"engine slept {seconds}s in accelerated mode")
+
+
+class RecordingBackend(ModelBackend):
+    """FakeModelBackend outcomes, plus call capture and a reentrancy guard."""
+
+    def __init__(
+        self, outcomes: Sequence[Decision | Exception],
+        on_call: Callable[[int], None] | None = None,
+    ) -> None:
+        self._fake = FakeModelBackend(outcomes)
+        self._on_call = on_call
+        self.calls: list[tuple[AgentConfig, list[dict[str, str]]]] = []
+        self.busy = False
+
+    def decide(self, agent: AgentConfig, messages: Sequence[dict[str, str]]) -> ModelResult:
+        assert not self.busy, "two model calls overlapped"
+        self.busy = True
+        try:
+            self.calls.append((agent, list(messages)))
+            if self._on_call is not None:
+                self._on_call(len(self.calls))
+            return self._fake.decide(agent, messages)
+        finally:
+            self.busy = False
+
+
+def accelerated_clock() -> VirtualClock:
+    return VirtualClock("accelerated", WALL, monotonic_fn=lambda: 0.0)
+
+
+def make_engine(
+    tmp_path: Path, config: RunConfig, backend: ModelBackend, **kwargs: Any,
+) -> tuple[SimulationEngine, EventStore, VirtualClock]:
+    store = EventStore(tmp_path / "room.sqlite3")
+    store.initialize()
+    clock = kwargs.pop("clock", accelerated_clock())
+    kwargs.setdefault("sleep_fn", forbidden_sleep)
+    engine = SimulationEngine(
+        config, store, backend, run_id="run-1", room_id="room-1", clock=clock,
+        wall_clock=lambda: WALL, **kwargs,
+    )
+    return engine, store, clock
+
+
+def events(store: EventStore) -> list[StoredEvent]:
+    return store.read_events("run-1", limit=100_000)
+
+
+def types(store: EventStore) -> list[str]:
+    return [event.type for event in events(store)]
+
+
+def history(messages: list[dict[str, str]]) -> str:
+    return messages[1]["content"]
+
+
+# --- lifecycle -------------------------------------------------------------
+
+def test_start_records_full_regime_and_stop_is_idempotent(tmp_path) -> None:
+    config = make_config()
+    engine, store, _ = make_engine(tmp_path, config, RecordingBackend([]))
+    with pytest.raises(RuntimeError):
+        engine.step()
+
+    started_id = engine.start()
+
+    [started] = events(store)
+    assert (started.id, started.type, started.agent_id) == (started_id, "session_started", None)
+    assert started.wall_ts == WALL.isoformat()
+    assert store.get_run("run-1").config == config
+    assert started.payload == {
+        "run_fingerprint": run_fingerprint(
+            config, prompt_hash=prompt_template_hash(), model_digests={"qwen3:4b": None}
+        ),
+        "config_hash": run_config_hash(config),
+        "prompt_hash": prompt_template_hash(),
+        "trait_renderer_version": TRAIT_RENDERER_VERSION,
+        "turn_format_version": TURN_FORMAT_VERSION,
+        "engine_version": ENGINE_VERSION,
+        "model_names": ["qwen3:4b"],
+        "model_digests": {"qwen3:4b": None},
+        "random_seed": 7,
+        "clock_mode": "accelerated",
+        "clock_speed": 1.0,
+        "startup_mode": "blank",
+        "runtime_mode": "balanced",
+        "sim_start_ms": 0,
+        "restart": False,
+    }
+    assert re.fullmatch(r"[0-9a-f]{64}", started.payload["run_fingerprint"])
+
+    ended_id = engine.stop()
+    assert engine.stop() is None
+    assert types(store) == ["session_started", "session_ended"]
+    ended = events(store)[-1]
+    assert (ended.id, ended.payload) == (ended_id, {"sim_end_ms": 0})
+    assert engine.step() == EngineStepResult("stopped", None)
+    assert types(store) == ["session_started", "session_ended"]
+
+
+def test_supplied_model_digests_enter_the_fingerprint(tmp_path) -> None:
+    config = make_config()
+    digests = {"qwen3:4b": "sha256:abc"}
+    engine, store, _ = make_engine(tmp_path, config, RecordingBackend([]), model_digests=digests)
+    engine.start()
+    payload = events(store)[0].payload
+    assert payload["model_digests"] == digests
+    assert payload["run_fingerprint"] == run_fingerprint(
+        config, prompt_hash=prompt_template_hash(), model_digests=digests
+    )
+    assert payload["run_fingerprint"] != run_fingerprint(
+        config, prompt_hash=prompt_template_hash(), model_digests={"qwen3:4b": None}
+    )
+
+
+# --- decisions -------------------------------------------------------------
+
+def test_waits_and_speech_commit_before_observers_and_feed_next_context(tmp_path) -> None:
+    reader = EventStore(tmp_path / "room.sqlite3")
+    seen: list[StoredEvent] = []
+
+    def observer(event: StoredEvent) -> None:
+        # A second connection can already read the event: it was committed first.
+        assert reader.read_events("run-1", after_id=event.id - 1, limit=1) == [event]
+        seen.append(event)
+
+    backend = RecordingBackend([WAIT, speak("hey"), WAIT])
+    engine, store, _ = make_engine(tmp_path, make_config(FORCED), backend, observer=observer)
+    engine.start()
+
+    results = [engine.step() for _ in range(3)]
+
+    assert [result.kind for result in results] == ["wait", "message", "wait"]
+    committed = events(store)
+    assert [event.type for event in committed] == ["session_started", "agent_wait", "message", "agent_wait"]
+    assert [result.event_id for result in results] == [event.id for event in committed[1:]]
+    speaker = backend.calls[1][0]
+    message = committed[2]
+    assert message.agent_id == speaker.id
+    assert message.payload == {
+        "speaker": speaker.name, "message": "hey", "target": None,
+        "scheduler_score": 1.0, "reasons": [], "latency_ms": 0.0,
+        "prompt_tokens": None, "output_tokens": None, "model": "qwen3:4b", "attempt": 1,
+    }
+    wait = committed[1]
+    assert wait.agent_id == backend.calls[0][0].id
+    assert wait.payload["attempt"] == 1 and "message" not in wait.payload
+    assert seen == committed
+    assert f"{speaker.name}: hey" not in history(backend.calls[1][1])
+    assert f"{speaker.name}: hey" in history(backend.calls[2][1])
+
+
+def test_model_calls_are_strictly_serial(tmp_path) -> None:
+    backend = RecordingBackend([WAIT, speak("one"), WAIT, speak("two"), WAIT] * 10)
+    engine, store, _ = make_engine(tmp_path, make_config(FORCED), backend)
+    engine.start()
+
+    engine.run(max_steps=50)
+
+    assert len(backend.calls) == 50
+    assert types(store).count("agent_wait") + types(store).count("message") == 50
+    assert "session_ended" not in types(store)
+
+
+def test_failed_attempts_are_infrastructure_events_never_waits(tmp_path) -> None:
+    backend = RecordingBackend([
+        BackendTimeoutError("slow"), DecisionValidationError("bad envelope"),
+        EmptyModelContentError("empty"), WAIT,
+    ])
+    engine, store, _ = make_engine(tmp_path, make_config(FORCED, retry_count=1), backend)
+    engine.start()
+
+    exhausted = engine.step()
+    recovered = engine.step()
+
+    committed = events(store)
+    assert [event.type for event in committed] == [
+        "session_started", "attempt_failed", "attempt_failed", "generation_failed",
+        "attempt_failed", "agent_wait",
+    ]
+    assert len(backend.calls) == 4
+    agent_id = backend.calls[0][0].id
+    assert all(event.agent_id == agent_id for event in committed[1:])
+    assert committed[1].payload == {
+        "attempt": 1, "error_class": "BackendTimeoutError", "error": "slow",
+        "scheduler_score": 1.0, "reasons": [],
+    }
+    assert committed[2].payload["attempt"] == 2
+    assert committed[2].payload["error_class"] == "DecisionValidationError"
+    assert committed[3].payload == {"attempts": 2, "last_error_class": "DecisionValidationError"}
+    assert exhausted == EngineStepResult("generation_failed", committed[3].id)
+    assert committed[4].payload["error_class"] == "EmptyModelContentError"
+    assert recovered == EngineStepResult("wait", committed[5].id)
+    assert committed[5].payload["attempt"] == 2
+
+
+def test_non_backend_errors_propagate_without_events(tmp_path) -> None:
+    backend = RecordingBackend([RuntimeError("engine bug")])
+    engine, store, _ = make_engine(tmp_path, make_config(FORCED), backend)
+    engine.start()
+    with pytest.raises(RuntimeError, match="engine bug"):
+        engine.step()
+    assert types(store) == ["session_started"]
+
+
+def test_prompt_context_is_bounded_to_recent_events(tmp_path) -> None:
+    backend = RecordingBackend([WAIT])
+    engine, store, _ = make_engine(tmp_path, make_config(FORCED, recent_context_events=2), backend)
+    engine.start()
+    for index in range(5):
+        store.commit_event(EventRecord(
+            "run-1", WALL.isoformat(), 0, "message", "milo",
+            {"speaker": "Milo", "message": f"line {index}", "target": None},
+        ))
+
+    engine.step()
+
+    transcript = history(backend.calls[0][1])
+    assert "Milo: line 3" in transcript and "Milo: line 4" in transcript
+    assert not any(f"line {index}" in transcript for index in range(3))
+
+
+def test_keyboard_interrupt_during_run_ends_session_and_reraises(tmp_path) -> None:
+    def interrupt(call: int) -> None:
+        if call == 2:
+            raise KeyboardInterrupt
+
+    backend = RecordingBackend([WAIT, WAIT], on_call=interrupt)
+    engine, store, _ = make_engine(tmp_path, make_config(FORCED), backend)
+    engine.start()
+    with pytest.raises(KeyboardInterrupt):
+        engine.run()
+    assert types(store) == ["session_started", "agent_wait", "session_ended"]
+
+
+# --- control, time, ambient, restart -----------------------------------------
+
+def test_pause_during_inference_lets_generation_commit_then_pauses(tmp_path) -> None:
+    controller = EventStore(tmp_path / "room.sqlite3")
+
+    def pause_on_first_call(call: int) -> None:
+        if call == 1:
+            controller.set_control("room-1", "paused")
+
+    sleeps: list[float] = []
+    backend = RecordingBackend([speak("hello"), WAIT], on_call=pause_on_first_call)
+    engine, store, clock = make_engine(tmp_path, make_config(FORCED), backend, sleep_fn=sleeps.append)
+    engine.start()
+
+    assert engine.step().kind == "message"
+    assert types(store) == ["session_started", "message"]
+    before = clock.now_ms()
+    assert engine.step() == EngineStepResult("paused", None)
+    assert engine.step() == EngineStepResult("paused", None)
+    assert len(backend.calls) == 1
+    assert clock.now_ms() == before  # a paused accelerated room accrues no simulated time
+    assert sleeps == [5.0, 5.0]
+    assert types(store) == ["session_started", "message"]
+
+    controller.set_control("room-1", "running")
+    assert engine.step().kind == "wait"
+    assert len(backend.calls) == 2
+
+    controller.set_control("room-1", "stop_requested")
+    stopped = engine.step()
+    assert stopped.kind == "stopped"
+    assert types(store) == ["session_started", "message", "agent_wait", "session_ended"]
+    assert stopped.event_id == events(store)[-1].id
+    assert engine.step().kind == "stopped"
+    assert len(backend.calls) == 2 and types(store).count("session_ended") == 1
+
+
+def test_ambient_silence_event_is_neutral_throttled_and_never_calls_model(tmp_path) -> None:
+    config = make_config({
+        **UNREACHABLE, "decision_tick_ms": 1_000, "silence_ambient_after_ms": 5_000,
+        "ambient_min_interval_ms": 12_000,
+    })
+    backend = RecordingBackend([])
+    engine, store, clock = make_engine(tmp_path, config, backend)
+    engine.start()
+
+    results = [engine.step() for _ in range(40)]
+
+    ambient = [event for event in events(store) if event.type == "environment"]
+    assert [event.sim_ms for event in ambient] == [5_000, 17_000, 29_000]
+    assert all(event.payload == {"text": "the room has been quiet for a while"} for event in ambient)
+    assert all(event.agent_id is None for event in ambient)
+    assert [result.event_id for result in results if result.kind == "ambient"] == [event.id for event in ambient]
+    assert {result.kind for result in results} == {"idle", "ambient"}
+    assert backend.calls == []
+    assert clock.now_ms() == 37_000  # 37 idle ticks; ambient steps do not advance time
+
+
+def test_ambient_interval_holds_when_waits_crowd_the_context_window(tmp_path) -> None:
+    # Root-cause regression: non-visible agent_wait events can push the last
+    # ambient event out of the bounded window; the interval must still hold.
+    elapsed = [0.0]
+
+    def one_second_per_call(call: int) -> None:
+        elapsed[0] += 1.0
+
+    config = make_config(
+        {**FORCED, "silence_ambient_after_ms": 5_000, "ambient_min_interval_ms": 12_000},
+        clock_mode="realtime", recent_context_events=2,
+    )
+    clock = VirtualClock("realtime", WALL, monotonic_fn=lambda: elapsed[0])
+    backend = RecordingBackend([WAIT] * 30, on_call=one_second_per_call)
+    engine, store, _ = make_engine(tmp_path, config, backend, clock=clock)
+    engine.start()
+
+    for _ in range(25):
+        engine.step()
+
+    ambient_ms = [event.sim_ms for event in events(store) if event.type == "environment"]
+    assert ambient_ms == [5_000, 17_000]
+
+
+def test_quiet_room_burn_never_spins_or_fabricates_speech(tmp_path) -> None:
+    config = make_config({"silence_ambient_after_ms": 60_000, "ambient_min_interval_ms": 120_000})
+    tick = config.scheduler.decision_tick_ms
+    backend = RecordingBackend([WAIT] * 500)
+    engine, store, clock = make_engine(tmp_path, config, backend)  # sleep_fn raises
+    engine.start()
+
+    kinds: list[str] = []
+    for _ in range(500):
+        before = clock.now_ms()
+        kind = engine.step().kind
+        kinds.append(kind)
+        assert clock.now_ms() - before == (tick if kind == "idle" else 0)
+
+    assert set(kinds) == {"wait", "idle", "ambient"}
+    assert len(backend.calls) == kinds.count("wait") == types(store).count("agent_wait")
+    assert "message" not in types(store)
+    ambient_ms = [event.sim_ms for event in events(store) if event.type == "environment"]
+    assert len(ambient_ms) == kinds.count("ambient") >= 2
+    assert all(later - earlier >= 120_000 for earlier, later in zip(ambient_ms, ambient_ms[1:]))
+    assert clock.now_ms() == kinds.count("idle") * tick > 0
+
+
+def test_restart_resumes_from_last_persisted_time_without_offline_events(tmp_path) -> None:
+    path = tmp_path / "room.sqlite3"
+    config = make_config(UNREACHABLE)
+    store = EventStore(path)
+    store.initialize()
+    first = SimulationEngine(
+        config, store, RecordingBackend([]), run_id="run-1", room_id="room-1",
+        wall_clock=lambda: WALL, sleep_fn=forbidden_sleep,
+    )
+    first.start()
+    for _ in range(4):
+        assert first.step().kind == "idle"
+    ended_id = first.stop()
+    store.close()
+
+    reopened = EventStore(path)
+    reopened.initialize()
+    later = datetime(2026, 10, 3, 9, tzinfo=timezone.utc)
+    second = SimulationEngine(
+        config, reopened, RecordingBackend([]), run_id="run-1", room_id="room-1",
+        wall_clock=lambda: later, sleep_fn=forbidden_sleep,
+    )
+    started_id = second.start()
+
+    committed = events(reopened)
+    assert [event.type for event in committed] == ["session_started", "session_ended", "session_started"]
+    assert started_id == ended_id + 1
+    assert committed[1].sim_ms == 20_000
+    assert committed[0].payload["restart"] is False
+    assert committed[2].payload["restart"] is True
+    assert committed[2].payload["sim_start_ms"] == committed[2].sim_ms == 20_000
+    assert reopened.get_run("run-1").started_at == WALL.isoformat()
+    assert second.step().kind == "idle"
+    second.stop()
+    assert events(reopened)[-1].payload == {"sim_end_ms": 25_000}

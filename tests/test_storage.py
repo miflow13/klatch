@@ -183,3 +183,20 @@ def test_pause_and_append_race_keeps_one_event_and_control(tmp_path) -> None:
     assert engine.get_control("room-1").desired_state == "paused"
     engine.close()
     controller.close()
+
+
+def test_read_recent_events_returns_last_n_in_ascending_order(tmp_path) -> None:
+    store = EventStore(tmp_path / "room.sqlite3")
+    store.initialize()
+    store.create_run(run_record())
+    ids = [store.append_event(message(sim_ms)) for sim_ms in (100, 200, 300, 400, 500)]
+
+    recent = store.read_recent_events("run-1", 2)
+    assert [event.id for event in recent] == ids[-2:]
+    assert [event.payload["message"] for event in recent] == ["message 400", "message 500"]
+    assert [event.id for event in store.read_recent_events("run-1", 50)] == ids
+    assert store.read_recent_events("run-1", 0) == []
+    assert store.read_recent_events("other-run", 5) == []
+    with pytest.raises(ValueError):
+        store.read_recent_events("run-1", -1)
+    store.close()
