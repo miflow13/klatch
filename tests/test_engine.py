@@ -1,7 +1,7 @@
 """The walking-skeleton engine composes store, clock, scheduler, prompts, and model."""
 
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -73,6 +73,25 @@ class RecordingBackend(ModelBackend):
             self.busy = False
 
 
+_OPEN_STORES: list[EventStore] = []
+
+
+def open_store(path: Path) -> EventStore:
+    """An EventStore that the autouse fixture below closes after the test (3.13+ warns on unclosed sqlite connections)."""
+    store = EventStore(path)
+    _OPEN_STORES.append(store)
+    return store
+
+
+@pytest.fixture(autouse=True)
+def close_open_stores() -> Iterator[None]:
+    try:
+        yield
+    finally:
+        while _OPEN_STORES:
+            _OPEN_STORES.pop().close()
+
+
 def accelerated_clock() -> VirtualClock:
     return VirtualClock("accelerated", WALL, monotonic_fn=lambda: 0.0)
 
@@ -80,7 +99,7 @@ def accelerated_clock() -> VirtualClock:
 def make_engine(
     tmp_path: Path, config: RunConfig, backend: ModelBackend, **kwargs: Any,
 ) -> tuple[SimulationEngine, EventStore, VirtualClock]:
-    store = EventStore(tmp_path / "room.sqlite3")
+    store = open_store(tmp_path / "room.sqlite3")
     store.initialize()
     clock = kwargs.pop("clock", accelerated_clock())
     kwargs.setdefault("sleep_fn", forbidden_sleep)
@@ -180,7 +199,7 @@ def test_supplied_model_digests_enter_the_fingerprint(tmp_path) -> None:
 # --- decisions -------------------------------------------------------------
 
 def test_waits_and_speech_commit_before_observers_and_feed_next_context(tmp_path) -> None:
-    reader = EventStore(tmp_path / "room.sqlite3")
+    reader = open_store(tmp_path / "room.sqlite3")
     seen: list[StoredEvent] = []
 
     def observer(event: StoredEvent) -> None:
@@ -315,7 +334,7 @@ def test_keyboard_interrupt_during_run_ends_session_and_reraises(tmp_path) -> No
 # --- control, time, ambient, restart -----------------------------------------
 
 def test_pause_during_inference_lets_generation_commit_then_pauses(tmp_path) -> None:
-    controller = EventStore(tmp_path / "room.sqlite3")
+    controller = open_store(tmp_path / "room.sqlite3")
 
     def pause_on_first_call(call: int) -> None:
         if call == 1:
@@ -351,7 +370,7 @@ def test_pause_during_inference_lets_generation_commit_then_pauses(tmp_path) -> 
 
 @pytest.mark.parametrize(("control", "next_kind"), [("paused", "paused"), ("stop_requested", "stopped")])
 def test_control_change_during_a_failed_attempt_stops_the_retries(tmp_path, control, next_kind) -> None:
-    controller = EventStore(tmp_path / "room.sqlite3")
+    controller = open_store(tmp_path / "room.sqlite3")
 
     def pause_on_first_call(call: int) -> None:
         if call == 1:
@@ -511,7 +530,7 @@ def test_restart_restores_decision_cooldowns_from_persisted_events(tmp_path) -> 
     # Forced regime: every agent scores 1.0 unless cooling down (score 0, below
     # threshold), so selection runs june, milo, ada, idle, june, ... in config order.
     config = make_config({**FORCED, "cooldown_penalty": 1.0})
-    store = EventStore(tmp_path / "room.sqlite3")
+    store = open_store(tmp_path / "room.sqlite3")
     store.initialize()
     asked: list[str] = []
     for _ in range(3):
@@ -533,7 +552,7 @@ def test_restart_restores_decision_cooldowns_from_persisted_events(tmp_path) -> 
 def test_restart_resumes_from_last_persisted_time_without_offline_events(tmp_path) -> None:
     path = tmp_path / "room.sqlite3"
     config = make_config(UNREACHABLE)
-    store = EventStore(path)
+    store = open_store(path)
     store.initialize()
     first = SimulationEngine(
         config, store, RecordingBackend([]), run_id="run-1", room_id="room-1",
@@ -545,7 +564,7 @@ def test_restart_resumes_from_last_persisted_time_without_offline_events(tmp_pat
     ended_id = first.stop()
     store.close()
 
-    reopened = EventStore(path)
+    reopened = open_store(path)
     reopened.initialize()
     later = datetime(2026, 10, 3, 9, tzinfo=timezone.utc)
     second = SimulationEngine(
@@ -569,9 +588,9 @@ def test_restart_resumes_from_last_persisted_time_without_offline_events(tmp_pat
 
 def restart_after_control(tmp_path: Path, control: str) -> tuple[SimulationEngine, EventStore]:
     config = make_config(UNREACHABLE)
-    store = EventStore(tmp_path / "room.sqlite3")
+    store = open_store(tmp_path / "room.sqlite3")
     store.initialize()
-    controller = EventStore(tmp_path / "room.sqlite3")
+    controller = open_store(tmp_path / "room.sqlite3")
     first = SimulationEngine(
         config, store, RecordingBackend([]), run_id="run-1", room_id="room-1",
         wall_clock=lambda: WALL, sleep_fn=lambda seconds: None,
