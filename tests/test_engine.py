@@ -31,6 +31,8 @@ FORCED = dict(
     base_bias=1.0, talkativeness_weight=0, direct_mention_bonus=0, topic_overlap_weight=0,
     elapsed_weight=0, relationship_weight=0, recent_speaker_penalty=0, cooldown_penalty=0,
     random_jitter=0,
+    # The scripted "one"/"two" texts form an alternating loop the scheduler would otherwise silence.
+    repetition_damping=0,
 )
 UNREACHABLE = {**FORCED, "base_bias": -1.0}
 

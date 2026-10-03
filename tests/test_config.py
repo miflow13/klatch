@@ -114,6 +114,12 @@ def test_runtime_rejects_invalid_operational_values(values: dict[str, object]) -
         RuntimeConfig(**values)
 
 
+@pytest.mark.parametrize("values", [{"repetition_window": 0}, {"repetition_window": -1}])
+def test_scheduler_rejects_a_repetition_window_below_one(values: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        SchedulerConfig(**values)
+
+
 def test_runtime_rejects_model_thinking_in_v0_1() -> None:
     with pytest.raises(ValidationError, match="v0.1 requires model_thinking=false"):
         RuntimeConfig(model_thinking=True)
@@ -213,7 +219,7 @@ def test_canonical_json_matches_independently_written_expected_string() -> None:
         '"direct_mention_bonus":0.55,"elapsed_weight":0.3,"random_jitter":0.15,'
         '"recent_speaker_penalty":0.45,"relationship_weight":0.1,'
         '"repetition_damping":0.5,"repetition_similarity_threshold":0.6,'
-        '"silence_ambient_after_ms":300000,"speaker_cooldown_ms":20000,'
+        '"repetition_window":5,"silence_ambient_after_ms":300000,"speaker_cooldown_ms":20000,'
         '"talkativeness_weight":0.45,"topic_overlap_weight":0.25,'
         '"wait_cooldown_ms":90000}}'
     )
@@ -283,7 +289,7 @@ def test_run_fingerprint_defaults_engine_version_constant() -> None:
         config, prompt_hash="p", model_digests=digests, engine_version=ENGINE_VERSION
     )
 
-    assert ENGINE_VERSION == "driftroom-engine-0.1.4"
+    assert ENGINE_VERSION == "driftroom-engine-0.1.5"
     assert run_fingerprint(config, prompt_hash="p", model_digests=digests) == explicit
 
 

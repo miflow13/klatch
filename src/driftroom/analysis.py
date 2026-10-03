@@ -60,11 +60,15 @@ class RunMetrics:
     decisions_per_sim_minute: float
     wait_ratio: float
     median_inference_ms: float | None
-    # Convergence: share of messages (from the second) whose Jaccard similarity to the
-    # previous message reaches the run's scheduler.repetition_similarity_threshold, and
-    # distinct tokens over all tokens across messages. Observer-only (spec §36).
+    # Convergence: share of messages (from the second) whose Jaccard similarity to any of
+    # the previous scheduler.repetition_window messages reaches the run's
+    # scheduler.repetition_similarity_threshold; distinct tokens over all tokens across
+    # messages; and share of messages that have an earlier message by the same speaker
+    # whose similarity to that speaker's previous message reaches the threshold.
+    # Observer-only and descriptive (spec §36): no environment reset here.
     repeated_message_ratio: float
     distinct_token_ratio: float
+    self_repetition_ratio: float
 
 
 def _read_all(store: EventStore, run_id: str) -> list[StoredEvent]:
@@ -101,10 +105,22 @@ def analyze_run(store: EventStore, run_id: str) -> RunMetrics:
     words = [len(text.split()) for text in texts]
     token_sets = [token_set(text) for text in texts]
     threshold = run.config.scheduler.repetition_similarity_threshold
+    window = run.config.scheduler.repetition_window
     repeats = sum(
-        1 for previous, current in zip(token_sets, token_sets[1:])
-        if jaccard(current, previous) >= threshold
+        1 for index in range(1, len(token_sets))
+        if any(
+            jaccard(token_sets[index], earlier) >= threshold
+            for earlier in token_sets[max(0, index - window):index]
+        )
     )
+    last_by_speaker: dict[str | None, set[str]] = {}
+    self_comparisons = self_repeats = 0
+    for event, current in zip(messages, token_sets):
+        previous = last_by_speaker.get(event.agent_id)
+        if previous is not None:
+            self_comparisons += 1
+            self_repeats += jaccard(current, previous) >= threshold
+        last_by_speaker[event.agent_id] = current
     token_total = sum(len(tokens(text)) for text in texts)
     per_agent = {agent.id: 0 for agent in run.config.agents}
     for event in messages:
@@ -144,4 +160,5 @@ def analyze_run(store: EventStore, run_id: str) -> RunMetrics:
         distinct_token_ratio=(
             len(set().union(*token_sets)) / token_total if token_total else 0.0
         ),
+        self_repetition_ratio=self_repeats / self_comparisons if self_comparisons else 0.0,
     )

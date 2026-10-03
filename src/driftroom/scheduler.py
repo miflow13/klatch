@@ -12,6 +12,17 @@ from .storage import StoredEvent
 from .text import jaccard, token_set
 
 
+def _echoes_recent(
+    index: int, texts: Sequence[set[str]], window: int, threshold: float
+) -> bool:
+    """True when ``texts[index]`` is at least ``threshold`` alike to any of the
+    ``window`` token sets just before it."""
+    return any(
+        jaccard(texts[index], earlier) >= threshold
+        for earlier in texts[max(0, index - window):index]
+    )
+
+
 @dataclass(frozen=True)
 class CandidateScore:
     agent_id: str
@@ -62,18 +73,23 @@ class Scheduler:
             if latest_message is not None else ""
         )
         latest_tokens = token_set(latest_text)
-        # Room-level repetition: the two most recent visible events are both
-        # messages saying nearly the same thing, so every agent's urge to add a
-        # third drops. An environment event (ambient or startup line) as either
-        # of them ends the rule, so a looping room recovers on the next one.
-        repeating = (
-            len(visible) >= 2
-            and visible[-1].type == "message"
-            and visible[-2].type == "message"
-            and jaccard(
-                token_set(str(visible[-1].payload.get("message", ""))),
-                token_set(str(visible[-2].payload.get("message", ""))),
-            ) >= self.config.repetition_similarity_threshold
+        # Repetition (spec §36), over the messages after the last environment event
+        # (an ambient or startup line restarts both rules, so a looping room recovers):
+        # - room: the latest message echoes one of the preceding ``repetition_window``
+        #   messages, so every agent's urge to add another drops ("repetition");
+        # - self: an agent's own last message echoes one of the preceding window
+        #   messages, so that agent's urge drops further ("self_repetition").
+        # A window of 1 is the pairwise rule; both use the similarity threshold and damping.
+        last_environment = max(
+            (i for i, event in enumerate(visible) if event.type == "environment"),
+            default=-1,
+        )
+        recent = [event for event in visible[last_environment + 1:] if event.type == "message"]
+        recent_sets = [token_set(str(event.payload.get("message", ""))) for event in recent]
+        window = self.config.repetition_window
+        threshold = self.config.repetition_similarity_threshold
+        repeating = len(recent) >= 2 and _echoes_recent(
+            len(recent) - 1, recent_sets, window, threshold
         )
         scores = []
         for agent in agents:
@@ -122,6 +138,15 @@ class Scheduler:
             if repeating and self.config.repetition_damping:
                 score -= self.config.repetition_damping
                 reasons.append("repetition")
+            own_recent = [i for i, event in enumerate(recent) if event.agent_id == agent.id]
+            if (
+                own_recent
+                and own_recent[-1] >= 1
+                and _echoes_recent(own_recent[-1], recent_sets, window, threshold)
+                and self.config.repetition_damping
+            ):
+                score -= self.config.repetition_damping
+                reasons.append("self_repetition")
             if self.config.cooldown_penalty:
                 last_decision = (
                     last_decision_ms.get(agent.id) if last_decision_ms is not None else None

@@ -68,6 +68,7 @@ def test_experimental_v1_scheduler_defaults_are_recorded() -> None:
         "wait_cooldown_ms": 90_000,
         "repetition_similarity_threshold": 0.6,
         "repetition_damping": 0.5,
+        "repetition_window": 5,
     }
 
 
@@ -232,7 +233,7 @@ def test_topic_overlap_uses_only_last_three_own_visible_messages() -> None:
     assert "topic_overlap" in score.reasons
 
 
-def test_repeating_room_damps_every_agent_by_exactly_the_configured_amount() -> None:
+def test_repeating_room_damps_every_agent_and_the_copying_speaker_twice() -> None:
     agents = [agent("june", "June"), agent("milo", "Milo"), agent("ada", "Ada")]
     scheduler = Scheduler(
         neutral_config(repetition_damping=0.5, repetition_similarity_threshold=0.6),
@@ -253,6 +254,12 @@ def test_repeating_room_damps_every_agent_by_exactly_the_configured_amount() -> 
     for agent_id in ("june", "milo", "ada"):
         assert "repetition" in damped[agent_id].reasons
         assert "repetition" not in normal[agent_id].reasons
+        assert "self_repetition" not in normal[agent_id].reasons
+    # Milo copied Ada, so he is the repeater: the room rule and his own rule both apply.
+    assert "self_repetition" in damped["milo"].reasons
+    assert normal["milo"].score - damped["milo"].score == pytest.approx(2 * 0.5)
+    for agent_id in ("june", "ada"):
+        assert "self_repetition" not in damped[agent_id].reasons
         assert normal[agent_id].score - damped[agent_id].score == pytest.approx(0.5)
 
 
@@ -308,6 +315,153 @@ def test_repetition_threshold_zero_always_damps_and_damping_zero_emits_nothing()
     assert "repetition" in always.score_agents([june], events, 50_000)[0].reasons
     assert "repetition" not in always.score_agents([june], events[:1], 50_000)[0].reasons
     assert off.score_agents([june], same, 50_000)[0].reasons == ()
+
+
+LOOP_A = "the harbor lights glow tonight"
+LOOP_A_COPY = "the harbor lights glow tonight friend"
+LOOP_B = "completely unrelated words about breakfast"
+LOOP_B_COPY = "completely unrelated words about breakfast again"
+
+
+def alternating_loop() -> list[StoredEvent]:
+    # Ada and Milo each copy their own previous line: A, B, A', B' (A' ~ A, B' ~ B, A !~ B).
+    return [
+        message(1, 0, "ada", LOOP_A),
+        message(2, 5_000, "milo", LOOP_B),
+        message(3, 10_000, "ada", LOOP_A_COPY),
+        message(4, 15_000, "milo", LOOP_B_COPY),
+    ]
+
+
+def dissimilar_scene() -> list[StoredEvent]:
+    return [
+        message(1, 0, "ada", "alpha bravo charlie"),
+        message(2, 5_000, "milo", "delta echo foxtrot"),
+        message(3, 10_000, "ada", "golf hotel india"),
+        message(4, 15_000, "milo", "juliet kilo lima"),
+    ]
+
+
+def score_by_agent(
+    scheduler: Scheduler, events: list[StoredEvent]
+) -> dict[str, CandidateScore]:
+    agents = [agent("june", "June"), agent("milo", "Milo"), agent("ada", "Ada")]
+    return {s.agent_id: s for s in scheduler.score_agents(agents, events, 50_000)}
+
+
+def test_alternating_loop_damps_the_room_and_each_repeater_over_the_window() -> None:
+    scheduler = Scheduler(neutral_config(repetition_window=5), rng=Random(3))
+
+    loop = score_by_agent(scheduler, alternating_loop())
+    normal = score_by_agent(scheduler, dissimilar_scene())
+
+    for agent_id in ("june", "milo", "ada"):
+        assert "repetition" in loop[agent_id].reasons
+        assert "repetition" not in normal[agent_id].reasons
+    for author in ("ada", "milo"):
+        assert "self_repetition" in loop[author].reasons
+        assert normal[author].score - loop[author].score == pytest.approx(2 * 0.5)
+    assert "self_repetition" not in loop["june"].reasons
+    assert normal["june"].score - loop["june"].score == pytest.approx(0.5)
+
+
+def test_window_one_is_the_pairwise_rule_and_misses_the_alternating_loop() -> None:
+    scheduler = Scheduler(neutral_config(repetition_window=1), rng=Random(3))
+
+    loop = score_by_agent(scheduler, alternating_loop())
+
+    for candidate in loop.values():
+        assert "repetition" not in candidate.reasons
+        assert "self_repetition" not in candidate.reasons
+        assert candidate.score == 0
+
+
+def test_window_one_matches_the_pairwise_rule_on_adjacent_echoes_and_environment_resets() -> None:
+    scheduler = Scheduler(neutral_config(repetition_window=1), rng=Random(3))
+    same = "the harbor lights glow tonight"
+    echo = [message(1, 0, "ada", same), message(2, 5_000, "milo", same)]
+    separated = [message(1, 0, "ada", same), message(2, 5_000, "milo", LOOP_B), message(3, 9_000, "june", same)]
+    cleared = [*echo, environment(3, 9_000, "quiet")]
+
+    assert "repetition" in score_by_agent(scheduler, echo)["june"].reasons
+    assert score_by_agent(scheduler, echo)["june"].score == pytest.approx(-0.5)
+    assert score_by_agent(scheduler, separated)["june"].score == 0
+    assert score_by_agent(scheduler, cleared)["june"].score == 0
+
+
+def test_an_echo_across_one_other_message_needs_a_window_of_at_least_two() -> None:
+    same = "the harbor lights glow tonight"
+    separated = [message(1, 0, "ada", same), message(2, 5_000, "milo", LOOP_B), message(3, 9_000, "june", same)]
+
+    narrow = score_by_agent(Scheduler(neutral_config(repetition_window=1), rng=Random(3)), separated)
+    wide = score_by_agent(Scheduler(neutral_config(repetition_window=2), rng=Random(3)), separated)
+
+    assert all("repetition" not in c.reasons for c in narrow.values())
+    assert all("repetition" in c.reasons for c in wide.values())
+
+
+def test_an_environment_event_after_the_loop_restarts_both_repetition_rules() -> None:
+    scheduler = Scheduler(neutral_config(repetition_window=5), rng=Random(3))
+    loop = alternating_loop()
+
+    after_environment = score_by_agent(scheduler, [*loop, environment(5, 20_000, "quiet")])
+    one_message_after = score_by_agent(
+        scheduler, [*loop, environment(5, 20_000, "quiet"), message(6, 25_000, "ada", LOOP_A)]
+    )
+
+    for scene in (after_environment, one_message_after):
+        for candidate in scene.values():
+            assert "repetition" not in candidate.reasons
+            assert "self_repetition" not in candidate.reasons
+            assert candidate.score == 0
+
+
+def test_an_agent_copying_another_agents_message_is_self_damped_without_the_room_rule() -> None:
+    scheduler = Scheduler(neutral_config(repetition_window=5), rng=Random(3))
+    events = [
+        message(1, 0, "ada", LOOP_A),
+        message(2, 5_000, "june", LOOP_A_COPY),  # June copies Ada
+        message(3, 10_000, "milo", LOOP_B),  # latest message is unlike everything before it
+    ]
+
+    scores = score_by_agent(scheduler, events)
+
+    assert all("repetition" not in c.reasons for c in scores.values())
+    assert "self_repetition" in scores["june"].reasons
+    assert scores["june"].score == pytest.approx(-0.5)
+    assert scores["ada"].score == 0 and scores["milo"].score == 0
+    assert "self_repetition" not in scores["ada"].reasons  # her only message has nothing before it
+    assert "self_repetition" not in scores["milo"].reasons
+
+
+def test_self_repetition_is_off_when_damping_is_zero() -> None:
+    scheduler = Scheduler(neutral_config(repetition_damping=0), rng=Random(3))
+
+    for candidate in score_by_agent(scheduler, alternating_loop()).values():
+        assert candidate.reasons == ()
+
+
+def test_alternating_loop_silences_the_default_room_until_an_environment_event_clears_it() -> None:
+    config = load_run_config(EXAMPLE_CONFIG)
+    scheduler = Scheduler(config.scheduler, rng=Random(1))
+    agents = config.agents
+    loop = [
+        message(1, 10_000_000, "ada", LOOP_A),
+        message(2, 10_005_000, "milo", LOOP_B),
+        message(3, 10_010_000, "ada", LOOP_A_COPY),
+        message(4, 10_015_000, "milo", LOOP_B_COPY),
+    ]
+    ambient = [*loop, environment(5, 10_300_000, "A quiet minute passes in the room.")]
+
+    looping = [scheduler.select_candidate(agents, loop, 10_360_000) for _ in range(2_000)]
+    recovered = [scheduler.select_candidate(agents, ambient, 10_360_000) for _ in range(2_000)]
+
+    assert all(c is None for c in looping)
+    assert any(c is not None for c in recovered)
+    for candidate in recovered:
+        if candidate is not None:
+            assert "repetition" not in candidate.reasons
+            assert "self_repetition" not in candidate.reasons
 
 
 def test_topic_overlap_above_the_repetition_threshold_adds_nothing() -> None:

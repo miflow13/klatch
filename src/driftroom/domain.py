@@ -69,11 +69,14 @@ class SchedulerConfig(StrictModel):
     ambient_min_interval_ms: int = Field(default=900_000, gt=0)
     speaker_cooldown_ms: int = Field(default=20_000, ge=0)
     wait_cooldown_ms: int = Field(default=90_000, ge=0)
-    # Two roles: the Jaccard threshold for the room-level repetition rule (the last two
-    # visible events are both messages at least this alike) and the cap above which the
-    # topic-overlap term contributes nothing. 0 disables topic overlap entirely.
+    # Two roles: the Jaccard threshold for the repetition rules (a message at least this
+    # alike to one of the preceding ``repetition_window`` messages) and the cap above which
+    # the topic-overlap term contributes nothing. 0 disables topic overlap entirely.
     repetition_similarity_threshold: float = Field(default=0.6, ge=0, le=1)
     repetition_damping: float = Field(default=0.5, ge=0)
+    # How many preceding messages (since the last environment event) the repetition rules
+    # compare against; 1 reproduces the pairwise rule.
+    repetition_window: int = Field(default=5, ge=1)
 
 
 class RuntimeConfig(StrictModel):

@@ -176,14 +176,22 @@ Copy from the run's `session_started` event(s) in the jsonl export.
 - `repeat_last_n`: 1024 (provisional; confirm with the offline probe). It is the window the
   repeat penalty looks back over (Ollama default 64 tokens covers only the NEXT ACTION text,
   so copying the previous message was never penalised). Recorded in each agent's `sampling`.
-- Repetition rule (`driftroom-engine-0.1.4`, spec §36): when the two most recent
-  visible events (message or environment) are both messages with Jaccard token similarity
-  >= `repetition_similarity_threshold` (0.6), every agent's score loses `repetition_damping`
-  (0.5) with reason `repetition`. An environment event (ambient or startup line) as either
-  of them ends the rule, so a looping room goes quiet and recovers on the next ambient event.
-  The topic-overlap term is capped (contributes nothing above that threshold; 0 disables it).
-- `analyze_run` now reports `repeated_message_ratio` and `distinct_token_ratio`. Gate-4
-  baseline (engine 0.1.3): `repeated_message_ratio` = ______ ; `distinct_token_ratio` = ______
+- Repetition rules (`driftroom-engine-0.1.5`, spec §36), over `repetition_window` (5) messages since
+  the last environment event: (1) when the latest message has Jaccard token similarity
+  >= `repetition_similarity_threshold` (0.6) to any of the preceding window messages, every agent's
+  score loses `repetition_damping` (0.5) with reason `repetition`; (2) an agent whose own last message
+  is that similar to any of the window messages before it loses `repetition_damping` with reason
+  `self_repetition` (both can stack). An environment event (ambient or startup line) restarts both
+  rules, so a looping room goes quiet and recovers on the next ambient event. Window 1 is the old
+  pairwise rule. The topic-overlap term is capped (contributes nothing above that threshold; 0
+  disables it) and is unchanged.
+- `analyze_run` reports `repeated_message_ratio` (now windowed: similarity to any of the previous
+  `repetition_window` messages), `distinct_token_ratio`, and `self_repetition_ratio` (messages similar
+  to their speaker's previous message, among messages with an earlier message by that speaker).
+  Baselines:
+  - gate-4 (engine 0.1.3): consecutive-pair `repeated_message_ratio` = 0.69 ; `distinct_token_ratio` = 0.09
+  - gate-5 (first 13 min): windowed `repeated_message_ratio` = 7/22 ~ 0.32 ; self-copies 6/22 ;
+    `distinct_token_ratio` = 0.28
 
 Note: the `room-transcript-v2` turn format is frozen from the first accepted gate run. Any
 later change to how the room transcript is rendered must bump `TURN_FORMAT_VERSION`.
@@ -199,5 +207,7 @@ Per-run decisions:
 
 - gate-4 (engine 0.1.3): recalibrate first — copy-the-last-message loop from minute 13; R17
   applied; gate-5 pending
+- gate-5 (first 13 min): recalibrate first — alternating two-thread loop from minute 7; R18 applied;
+  gate-6 pending
 
 Date: ________ — Signed: ________
