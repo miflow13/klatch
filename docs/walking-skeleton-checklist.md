@@ -66,7 +66,7 @@ driftroom start --db room.sqlite3 --config driftroom.example.toml
 >   - `blank` (the spec default): nothing. The first prompt's ROOM HISTORY reads
 >     `(no messages yet)`.
 >   - `environment`: one environment line naming who is in the room, in config order, e.g.
->     `[00:00] (June, Milo and Ada are in the room)`.
+>     `[14:00] (June, Milo and Ada are in the room)`.
 >   - `topic`: one environment line `the room was opened with the topic: <topic>`, with
 >     `runtime.topic` set (it is required in this mode and rejected in the others).
 >   - `custom` is reserved and rejected in v0.1.
@@ -161,8 +161,9 @@ should be recalibrated — prompt, sampling, or scheduler — before Tasks 9–1
 
 Findings (carried from runs):
 
-- say/quiet: neither model chose quiet in 36 constrained samples with conversation present; all
-  silence in gate-6 came from the scheduler. (Probe 2026-10-03, §6.)
+- say/quiet: across gate-6 and gate-7, 46 real decisions with conversation present and 0 `quiet` on
+  either model; all silence came from the scheduler. Probe: 0/36 quiet with context; 1-2/8 quiet
+  only in an empty room. (Probe 2026-10-03, §6.)
 
 ## 5. Regime record
 
@@ -203,10 +204,19 @@ Copy from the run's `session_started` event(s) in the jsonl export.
 - `repeat_penalty`: 1.15 (default; was 1.08). Reason: in the offline probe of 2026-10-03 (§6) it cut
   qwen3:4b similarity to the previous 5 messages from 0.65 to 0.42, and moved qwen3:8b-q4_K_M
   from 0.18 to 0.17. Recorded in each agent's `sampling` and in the config hash.
+- `clock_display_start`: "14:00" (default; recorded in `runtime`, so it changes the config hash).
+  Transcript stamps `[hh:mm]` are the simulated time since the run began added to this start,
+  rendered modulo 24 h (a run past 10 h wraps to `[00:xx]`); the "[about N minutes later]" gaps are
+  unchanged. A midnight start made both models read `[00:02]` as minutes past midnight and open every
+  run with sleep talk (clock probe 2026-10-03, §6). It is not a directive: the room still shows a
+  clock. `TURN_FORMAT_VERSION` is `room-transcript-v3` for this reason, so the prompt hash moves too;
+  the engine version is unchanged. The observer, CLI and text export still show elapsed simulated
+  time (`[00:02]` is two minutes in), so an export line will not match the same line in the prompt
+  unless the start is `00:00`.
 - qwen3:8b-q4_K_M at `num_ctx` 8192 splits 13%/87% CPU/GPU on the RTX 3070 Ti (6.6 GB per
   `ollama ps`); `max_context_tokens` 6144 is recommended for full GPU residency.
 
-Note: the `room-transcript-v2` turn format is frozen from the first accepted gate run. Any
+Note: the `room-transcript-v3` turn format is frozen from the first accepted gate run. Any
 later change to how the room transcript is rendered must bump `TURN_FORMAT_VERSION`.
 
 ## 6. Gate decision
@@ -230,6 +240,15 @@ Per-run decisions:
   median_inference_ms 763 (mean 917), repeated_message_ratio 0.11, same_speaker_repetition_ratio 0.0,
   distinct_token_ratio 0.34. Applied: `repeat_penalty` default 1.15 (R19); gate-7 runs on
   qwen3:8b-q4_K_M via the user's env.toml (example model unchanged).
+- gate-7 (engine 0.1.5, qwen3:8b-q4_K_M, repeat_penalty 1.15, first 47 sim-min, stopped by the user
+  later): recalibrate first — template convergence ("nighty night all" / "cat pics are the best
+  sleep thieves") by 00:11, exact self-copies at 00:31/00:32; the silence -> ambient -> burst cycle
+  from R17/R18 worked as designed; the sleep theme traced to the midnight clock (R20,
+  `clock_display_start`). Metrics: visible_messages 27, valid_waits 0, generation_failures 0,
+  silence_periods 3, ambient_events 3, messages_per_agent june 5 / milo 14 / ada 8,
+  mean_message_words 21.2 (median 19), decisions_per_sim_minute 0.55, wait_ratio 0.0,
+  median_inference_ms 771 (mean 1383), repeated_message_ratio 0.115,
+  same_speaker_repetition_ratio 0.125, distinct_token_ratio 0.30.
 
 Probe 2026-10-03 (gate-6 context replayed, 20 visible events, 6 samples per cell,
 grammar-constrained, think=false; similarity = mean over samples of the max Jaccard word-set
@@ -243,5 +262,19 @@ similarity to the previous 5 messages; RTX 3070 Ti):
 | qwen3:8b-q4_K_M | default | 0/6 | 0.18 | 3.0 (incl. load) |
 | qwen3:8b-q4_K_M | rp 1.15 | 0/6 | 0.17 | 1.0 |
 | qwen3:8b-q4_K_M | rp 1.15 + temp 1.0 | 0/6 | 0.15 | 0.9 |
+
+Clock probe 2026-10-03 (qwen3:8b, empty room, 8 samples x 3 agents, grammar-constrained,
+think=false; RTX 3070 Ti; share of openings containing a sleep/night word):
+
+| variant | openings with a sleep/night word |
+|---------|----------------------------------|
+| stamps `[00:00]` | 5/23 |
+| stamps `[00:00]` (second run) | 9/24 |
+| stamps `[14:00]` | 1/23 |
+| relative stamps `[+00:00]` with a legend line | 9/24 (no help) |
+| empty CURRENT STATE / RELATIONSHIPS / MEMORIES headings removed | 4/24 (no effect) |
+
+Under `[14:00]` the invented offline life moved to daytime (walks, parks). Decision: record a daytime
+clock start (`clock_display_start = "14:00"`, §5).
 
 Date: ________ — Signed: ________

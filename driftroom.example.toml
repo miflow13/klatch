@@ -80,4 +80,6 @@ retry_count = 1
 max_context_tokens = 8192
 clock_mode = "realtime"
 clock_speed = 1.0
+# The clock the participants see (HH:MM); a midnight start made both models open every run with sleep talk.
+clock_display_start = "14:00"
 # random_seed = 1234  # optional, for controlled experiments

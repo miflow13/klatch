@@ -1,6 +1,7 @@
 """Validated domain configuration models for a Driftroom run."""
 
 from collections.abc import Mapping
+import re
 from typing import Any, Literal
 
 from pydantic import (
@@ -95,6 +96,9 @@ class RuntimeConfig(StrictModel):
     clock_mode: Literal["realtime", "accelerated"] = "realtime"
     clock_speed: float = Field(default=1.0, gt=0)
     max_context_tokens: int = Field(default=8192, gt=0)
+    # The clock the participants see: transcript stamps start here instead of 00:00
+    # (a midnight start made both models open every run with sleep talk). HH:MM.
+    clock_display_start: str = "14:00"
 
     @field_validator("model_thinking")
     @classmethod
@@ -103,6 +107,13 @@ class RuntimeConfig(StrictModel):
         # so a rejected assignment leaves the object unchanged.
         if value:
             raise ValueError("v0.1 requires model_thinking=false")
+        return value
+
+    @field_validator("clock_display_start")
+    @classmethod
+    def clock_display_start_is_hh_mm(cls, value: str) -> str:
+        if not re.fullmatch(r"([01][0-9]|2[0-3]):[0-5][0-9]", value):
+            raise ValueError("clock_display_start must be HH:MM with 00 <= HH <= 23 and 00 <= MM <= 59")
         return value
 
     @field_validator("startup_mode")

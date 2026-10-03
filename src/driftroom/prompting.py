@@ -13,8 +13,9 @@ TRAIT_RENDERER_VERSION = "traits-v1"
 # v1 was frozen at the first recorded run. v2 renders an empty room as
 # "(no messages yet)" instead of a blank ROOM HISTORY section. v2 frozen from the
 # first accepted gate run: any further change to the transcript format must bump
-# this version.
-TURN_FORMAT_VERSION = "room-transcript-v2"
+# this version. v3 stamps lines from a recorded clock_display_start instead of
+# always from 00:00.
+TURN_FORMAT_VERSION = "room-transcript-v3"
 EMPTY_ROOM_HISTORY = "(no messages yet)"
 _PROMPTS = Path(__file__).resolve().parent / "prompts"
 
@@ -63,7 +64,15 @@ def render_traits(agent: AgentConfig) -> str:
     )
 
 
-def render_room_history(events: Sequence[StoredEvent], now_sim_ms: int) -> str:
+def clock_display_offset_ms(start: str) -> int:
+    """Milliseconds from midnight for a validated ``HH:MM`` clock_display_start."""
+    hours, minutes = start.split(":")
+    return (int(hours) * 60 + int(minutes)) * 60_000
+
+
+def render_room_history(
+    events: Sequence[StoredEvent], now_sim_ms: int, *, display_offset_ms: int = 0,
+) -> str:
     """Show committed speech and neutral environment events as a room transcript.
 
     Environment events are unattributed descriptions rendered in parentheses;
@@ -71,7 +80,9 @@ def render_room_history(events: Sequence[StoredEvent], now_sim_ms: int) -> str:
     lines of a text are indented under the stamp, so text can never start a
     transcript line and pass as another speaker; the stored text is unchanged.
     A room with no visible events renders as an explicit "(no messages yet)",
-    never as an empty section.
+    never as an empty section. Stamps read as a 24-hour clock that starts
+    ``display_offset_ms`` after midnight and wraps; silence gaps are differences,
+    so the offset does not touch them.
     """
     lines: list[str] = []
     last_visible_ms: int | None = None
@@ -81,7 +92,7 @@ def render_room_history(events: Sequence[StoredEvent], now_sim_ms: int) -> str:
         if last_visible_ms is not None and event.sim_ms - last_visible_ms >= 300_000:
             minutes = round((event.sim_ms - last_visible_ms) / 60_000)
             lines.append(f"[about {minutes} minutes later]")
-        minutes = event.sim_ms // 60_000
+        minutes = (event.sim_ms + display_offset_ms) // 60_000 % 1440
         stamp = f"[{minutes // 60:02d}:{minutes % 60:02d}]"
         continuation = "\n" + " " * len(stamp + " ")
         if event.type == "environment":
@@ -106,6 +117,7 @@ class TurnContext:
     current_state: str = ""
     relationships: str = ""
     memories: str = ""
+    display_offset_ms: int = 0
 
 
 def build_turn_messages(context: TurnContext) -> list[dict[str, str]]:
@@ -121,7 +133,9 @@ def build_turn_messages(context: TurnContext) -> list[dict[str, str]]:
                 current_state=context.current_state,
                 relationships=context.relationships,
                 memories=context.memories,
-                room_history=render_room_history(context.events, context.now_sim_ms),
+                room_history=render_room_history(
+                    context.events, context.now_sim_ms, display_offset_ms=context.display_offset_ms,
+                ),
             ),
         },
     ]

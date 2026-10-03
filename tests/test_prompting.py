@@ -135,9 +135,58 @@ def test_an_empty_room_turn_shows_no_messages_yet_under_room_history() -> None:
     assert "ROOM HISTORY\n(no messages yet)\n\nNEXT ACTION" in turn
 
 
-def test_turn_format_version_is_v2() -> None:
+def test_turn_format_version_is_v3() -> None:
     prompting = importlib.import_module("driftroom.prompting")
-    assert prompting.TURN_FORMAT_VERSION == "room-transcript-v2"
+    assert prompting.TURN_FORMAT_VERSION == "room-transcript-v3"
+
+
+@pytest.mark.parametrize(
+    ("start", "offset_ms"),
+    [("00:00", 0), ("14:00", 50_400_000), ("14:05", 50_700_000), ("23:59", 86_340_000)],
+)
+def test_clock_display_offset_converts_hh_mm_to_milliseconds(start: str, offset_ms: int) -> None:
+    prompting = importlib.import_module("driftroom.prompting")
+    assert prompting.clock_display_offset_ms(start) == offset_ms
+
+
+def test_display_offset_shifts_every_stamp_from_the_clock_start() -> None:
+    prompting = importlib.import_module("driftroom.prompting")
+    startup = StoredEvent(
+        1, "run-1", "2026-10-01T12:00:00Z", 0, "environment", None,
+        {"text": "June and Milo are in the room", "kind": "startup"},
+    )
+    rendered = prompting.render_room_history(
+        [startup, room_event(2, 120_000, "June", "hey")], now_sim_ms=120_000,
+        display_offset_ms=prompting.clock_display_offset_ms("14:00"),
+    )
+    assert rendered == "[14:00] (June and Milo are in the room)\n[14:02] June: hey"
+
+
+def test_display_offset_wraps_past_midnight() -> None:
+    prompting = importlib.import_module("driftroom.prompting")
+    rendered = prompting.render_room_history(
+        [room_event(1, 10 * 3_600_000 + 5 * 60_000, "June", "still here")],
+        now_sim_ms=10 * 3_600_000 + 5 * 60_000,
+        display_offset_ms=prompting.clock_display_offset_ms("14:00"),
+    )
+    assert rendered == "[00:05] June: still here"
+
+
+def test_display_offset_leaves_the_silence_gap_marker_unchanged() -> None:
+    prompting = importlib.import_module("driftroom.prompting")
+    offset = prompting.clock_display_offset_ms("14:00")
+    events = [room_event(1, 0, "June", "hey"), room_event(2, 420_000, "Milo", "back")]
+    shifted = prompting.render_room_history(events, now_sim_ms=420_000, display_offset_ms=offset)
+    assert shifted == "[14:00] June: hey\n[about 7 minutes later]\n[14:07] Milo: back"
+
+
+def test_turn_context_offset_reaches_the_rendered_turn() -> None:
+    prompting = importlib.import_module("driftroom.prompting")
+    context = prompting.TurnContext(
+        agent(), [room_event(1, 120_000, "Atlas", "anyone here?")], 120_000,
+        display_offset_ms=prompting.clock_display_offset_ms("14:00"),
+    )
+    assert "[14:02] Atlas: anyone here?" in prompting.build_turn_messages(context)[1]["content"]
 
 
 def test_turn_messages_keep_room_history_inside_observed_context() -> None:
@@ -196,7 +245,7 @@ def test_prompt_bundle_hash_changes_with_template_bytes_and_versions(tmp_path, m
     monkeypatch.setattr(prompting, "TRAIT_RENDERER_VERSION", "traits-v2")
     assert prompting.prompt_template_hash() != baseline
     monkeypatch.setattr(prompting, "TRAIT_RENDERER_VERSION", "traits-v1")
-    monkeypatch.setattr(prompting, "TURN_FORMAT_VERSION", "room-transcript-v3")
+    monkeypatch.setattr(prompting, "TURN_FORMAT_VERSION", "room-transcript-v4")
     assert prompting.prompt_template_hash() != baseline
 
 

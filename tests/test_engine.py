@@ -488,7 +488,7 @@ def test_environment_mode_opens_with_one_presence_line_before_any_decision(tmp_p
     assert backend.calls == []
 
     assert engine.step().kind == "wait"
-    assert "ROOM HISTORY\n[00:00] (June, Milo and Ada are in the room)\n\nNEXT ACTION" in history(
+    assert "ROOM HISTORY\n[14:00] (June, Milo and Ada are in the room)\n\nNEXT ACTION" in history(
         backend.calls[0][1]
     )
 
@@ -503,7 +503,16 @@ def test_topic_mode_opens_with_the_topic_as_an_environment_line(tmp_path) -> Non
     assert (opening.type, opening.agent_id, opening.sim_ms) == ("environment", None, started.sim_ms)
     assert opening.payload == {"text": "the room was opened with the topic: rain on the roof", "kind": "startup"}
     engine.step()
-    assert "[00:00] (the room was opened with the topic: rain on the roof)" in history(backend.calls[0][1])
+    assert "[14:00] (the room was opened with the topic: rain on the roof)" in history(backend.calls[0][1])
+
+
+def test_the_prompt_stamps_start_from_the_configured_clock_display_start(tmp_path) -> None:
+    backend = RecordingBackend([WAIT])
+    config = make_config(FORCED, startup_mode="environment", clock_display_start="09:30")
+    engine, _, _ = make_engine(tmp_path, config, backend)
+    engine.start()
+    engine.step()
+    assert "[09:30] (June, Milo and Ada are in the room)" in history(backend.calls[0][1])
 
 
 def test_blank_mode_writes_nothing_and_the_first_prompt_says_no_messages_yet(tmp_path) -> None:

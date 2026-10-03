@@ -18,7 +18,8 @@ from .config import ENGINE_VERSION, run_config_hash, run_fingerprint
 from .domain import VISIBLE_EVENT_TYPES, RunConfig, is_ambient_event
 from .models.base import BackendError, Decision, DecisionValidationError, ModelBackend, raw_excerpt
 from .prompting import (
-    TRAIT_RENDERER_VERSION, TURN_FORMAT_VERSION, TurnContext, build_turn_messages, prompt_template_hash,
+    TRAIT_RENDERER_VERSION, TURN_FORMAT_VERSION, TurnContext, build_turn_messages,
+    clock_display_offset_ms, prompt_template_hash,
 )
 from .scheduler import CandidateScore, Scheduler
 from .storage import EventRecord, EventStore, RunRecord, StoredEvent
@@ -203,7 +204,10 @@ class SimulationEngine:
 
     def _decide(self, candidate: CandidateScore, recent: Sequence[StoredEvent], now: int) -> EngineStepResult:
         agent = next(agent for agent in self.config.agents if agent.id == candidate.agent_id)
-        messages = build_turn_messages(TurnContext(agent, recent, now))
+        messages = build_turn_messages(TurnContext(
+            agent, recent, now,
+            display_offset_ms=clock_display_offset_ms(self.config.runtime.clock_display_start),
+        ))
         # Who this agent may address: the other participants, by display name (§11).
         targets = [other.name for other in self.config.agents if other.id != agent.id]
         selection = {"scheduler_score": candidate.score, "reasons": list(candidate.reasons)}

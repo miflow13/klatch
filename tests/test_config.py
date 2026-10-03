@@ -33,6 +33,7 @@ def test_configuration_defaults() -> None:
     assert RuntimeConfig().random_seed is None
     assert RuntimeConfig().clock_mode == "realtime"
     assert RuntimeConfig().clock_speed == 1.0
+    assert RuntimeConfig().clock_display_start == "14:00"
     assert RuntimeConfig().max_context_tokens == 8192
 
 
@@ -107,6 +108,11 @@ def test_sampling_rejects_out_of_range_and_nonfinite_values(values: dict[str, ob
         {"clock_mode": "paused"},
         {"max_context_tokens": 0},
         {"random_seed": 1.5},
+        {"clock_display_start": "24:00"},
+        {"clock_display_start": "9:00"},
+        {"clock_display_start": "14:0"},
+        {"clock_display_start": "12:60"},
+        {"clock_display_start": ""},
     ],
 )
 def test_runtime_rejects_invalid_operational_values(values: dict[str, object]) -> None:
@@ -118,6 +124,11 @@ def test_runtime_rejects_invalid_operational_values(values: dict[str, object]) -
 def test_scheduler_rejects_a_repetition_window_below_one(values: dict[str, object]) -> None:
     with pytest.raises(ValidationError, match="greater than or equal to 1"):
         SchedulerConfig(**values)
+
+
+@pytest.mark.parametrize("value", ["00:00", "14:00", "23:59"])
+def test_runtime_accepts_clock_display_start_hh_mm(value: str) -> None:
+    assert RuntimeConfig(clock_display_start=value).clock_display_start == value
 
 
 def test_runtime_rejects_model_thinking_in_v0_1() -> None:
@@ -209,7 +220,7 @@ def test_canonical_json_matches_independently_written_expected_string() -> None:
 
     expected = (
         '{"agents":[' + ",".join(agent(ident) for ident in "abc") + "],"
-        '"runtime":{"clock_mode":"realtime","clock_speed":1.0,'
+        '"runtime":{"clock_display_start":"14:00","clock_mode":"realtime","clock_speed":1.0,'
         '"inference_timeout_seconds":120.0,"max_context_tokens":8192,'
         '"max_output_tokens":256,"model_thinking":false,"random_seed":null,'
         '"recent_context_events":20,"retry_count":1,'
