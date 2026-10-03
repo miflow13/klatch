@@ -159,6 +159,11 @@ should be recalibrated — prompt, sampling, or scheduler — before Tasks 9–1
 
 > ______________________
 
+Findings (carried from runs):
+
+- say/quiet: neither model chose quiet in 36 constrained samples with conversation present; all
+  silence in gate-6 came from the scheduler. (Probe 2026-10-03, §6.)
+
 ## 5. Regime record
 
 Copy from the run's `session_started` event(s) in the jsonl export.
@@ -195,6 +200,12 @@ Copy from the run's `session_started` event(s) in the jsonl export.
   - gate-5 (first 13 min): windowed `repeated_message_ratio` = 7/22 ~ 0.32 ; self-copies 6/22 ;
     `distinct_token_ratio` = 0.28
 
+- `repeat_penalty`: 1.15 (default; was 1.08). Reason: in the offline probe of 2026-10-03 (§6) it cut
+  qwen3:4b similarity to the previous 5 messages from 0.65 to 0.42, and moved qwen3:8b-q4_K_M
+  from 0.18 to 0.17. Recorded in each agent's `sampling` and in the config hash.
+- qwen3:8b-q4_K_M at `num_ctx` 8192 splits 13%/87% CPU/GPU on the RTX 3070 Ti (6.6 GB per
+  `ollama ps`); `max_context_tokens` 6144 is recommended for full GPU residency.
+
 Note: the `room-transcript-v2` turn format is frozen from the first accepted gate run. Any
 later change to how the room transcript is rendered must bump `TURN_FORMAT_VERSION`.
 
@@ -211,5 +222,26 @@ Per-run decisions:
   applied; gate-5 pending
 - gate-5 (first 13 min): recalibrate first — alternating two-thread loop from minute 7; R18 applied;
   gate-6 pending
+- gate-6 (engine 0.1.5, qwen3:4b, environment mode, ~12.5 sim-min, stopped by the user when lines
+  began repeating a template): recalibrate first — template repetition; the say/quiet decision was
+  never "quiet" once conversation existed. Metrics: visible_messages 19, valid_waits 0,
+  generation_failures 0, silence_periods 0, ambient_events 0, messages_per_agent june 2 / milo 10 /
+  ada 7, mean_message_words 26.2 (median 22), decisions_per_sim_minute 1.52, wait_ratio 0.0,
+  median_inference_ms 763 (mean 917), repeated_message_ratio 0.11, same_speaker_repetition_ratio 0.0,
+  distinct_token_ratio 0.34. Applied: `repeat_penalty` default 1.15 (R19); gate-7 runs on
+  qwen3:8b-q4_K_M via the user's env.toml (example model unchanged).
+
+Probe 2026-10-03 (gate-6 context replayed, 20 visible events, 6 samples per cell,
+grammar-constrained, think=false; similarity = mean over samples of the max Jaccard word-set
+similarity to the previous 5 messages; RTX 3070 Ti):
+
+| model | setting | quiet | similarity | mean s/call |
+|-------|---------|-------|------------|-------------|
+| qwen3:4b | default (rp 1.08, temp 0.8) | 0/6 | 0.65 | — |
+| qwen3:4b | rp 1.15 | 0/6 | 0.42 | — |
+| qwen3:4b | rp 1.15 + temp 1.0 | 0/6 | 0.49 | — |
+| qwen3:8b-q4_K_M | default | 0/6 | 0.18 | 3.0 (incl. load) |
+| qwen3:8b-q4_K_M | rp 1.15 | 0/6 | 0.17 | 1.0 |
+| qwen3:8b-q4_K_M | rp 1.15 + temp 1.0 | 0/6 | 0.15 | 0.9 |
 
 Date: ________ — Signed: ________

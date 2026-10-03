@@ -24,7 +24,7 @@ def test_configuration_defaults() -> None:
     assert SamplingConfig().temperature == 0.8
     assert SamplingConfig().top_p == 0.9
     assert SamplingConfig().top_k == 40
-    assert SamplingConfig().repeat_penalty == 1.08
+    assert SamplingConfig().repeat_penalty == 1.15
     assert SamplingConfig().repeat_last_n == 1024
     assert RuntimeConfig().startup_mode == "blank"
     assert RuntimeConfig().topic is None
@@ -201,7 +201,7 @@ def test_canonical_json_matches_independently_written_expected_string() -> None:
     def agent(ident: str) -> str:
         return (
             '{"id":"' + ident + '","model":"m","name":"' + ident.upper() + '",'
-            '"sampling":{"repeat_last_n":1024,"repeat_penalty":1.08,"temperature":0.8,'
+            '"sampling":{"repeat_last_n":1024,"repeat_penalty":1.15,"temperature":0.8,'
             '"top_k":40,"top_p":0.9},'
             '"traits":{"curiosity":0.5,"formality":0.5,"humor":0.5,'
             '"impulsiveness":0.5,"reserved":0.5}}'

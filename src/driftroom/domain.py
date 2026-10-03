@@ -31,7 +31,7 @@ class SamplingConfig(StrictModel):
     temperature: float = Field(default=0.8, ge=0)
     top_p: float = Field(default=0.9, ge=0, le=1)
     top_k: int = Field(default=40, ge=0)
-    repeat_penalty: float = Field(default=1.08, gt=0)
+    repeat_penalty: float = Field(default=1.15, gt=0)
     # Window the repeat penalty looks back over (Ollama: 0 disables, -1 = num_ctx).
     # Provisional default; large enough to cover the room history in the prompt.
     repeat_last_n: int = Field(default=1024, ge=-1)
