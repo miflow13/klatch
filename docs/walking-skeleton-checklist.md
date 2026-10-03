@@ -22,6 +22,8 @@ ollama pull qwen3:4b
 driftroom start --db room.sqlite3 --config driftroom.example.toml
 ```
 
+- The wheel-asset test is skipped unless `pip` and `setuptools` are importable in the venv
+  (`pip install setuptools` to exercise it); it does not affect running Driftroom.
 - Ollama is reached at `OLLAMA_HOST` (default `http://127.0.0.1:11434`); `--host URL` overrides it.
 - A new run uses room `room-1` unless `--room` is given. `start` prints the run id
   (`run id: run-<UTC timestamp>` unless `--run` is given): `watch`, `status`, `export` and a
