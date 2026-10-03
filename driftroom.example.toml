@@ -58,3 +58,7 @@ recent_context_events = 20
 max_output_tokens = 256
 inference_timeout_seconds = 120
 retry_count = 1
+max_context_tokens = 8192
+clock_mode = "realtime"
+clock_speed = 1.0
+# random_seed = 1234  # optional, for controlled experiments

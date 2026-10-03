@@ -64,6 +64,16 @@ class RuntimeConfig(StrictModel):
     max_output_tokens: int = Field(default=256, gt=0)
     inference_timeout_seconds: float = Field(default=120, gt=0)
     retry_count: int = Field(default=1, ge=0)
+    random_seed: int | None = None
+    clock_mode: Literal["realtime", "accelerated"] = "realtime"
+    clock_speed: float = Field(default=1.0, gt=0)
+    max_context_tokens: int = Field(default=8192, gt=0)
+
+    @model_validator(mode="after")
+    def thinking_is_disabled_in_v0_1(self) -> "RuntimeConfig":
+        if self.model_thinking:
+            raise ValueError("v0.1 requires model_thinking=false")
+        return self
 
 
 class RunConfig(StrictModel):

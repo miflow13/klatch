@@ -1,10 +1,12 @@
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from driftroom.config import (
+    ENGINE_VERSION,
     AgentConfig,
     AgentTraits,
     RunConfig,
@@ -14,6 +16,7 @@ from driftroom.config import (
     canonical_config_json,
     load_run_config,
     run_config_hash,
+    run_fingerprint,
 )
 
 
@@ -25,6 +28,10 @@ def test_configuration_defaults() -> None:
     assert RuntimeConfig().startup_mode == "blank"
     assert RuntimeConfig().runtime_mode == "balanced"
     assert RuntimeConfig().model_thinking is False
+    assert RuntimeConfig().random_seed is None
+    assert RuntimeConfig().clock_mode == "realtime"
+    assert RuntimeConfig().clock_speed == 1.0
+    assert RuntimeConfig().max_context_tokens == 8192
 
 
 def test_example_has_three_agents_on_shared_model() -> None:
@@ -86,6 +93,12 @@ def test_sampling_rejects_out_of_range_and_nonfinite_values(values: dict[str, ob
         {"inference_timeout_seconds": 0},
         {"inference_timeout_seconds": float("inf")},
         {"retry_count": -1},
+        {"clock_speed": 0},
+        {"clock_speed": -1.0},
+        {"clock_speed": float("inf")},
+        {"clock_mode": "paused"},
+        {"max_context_tokens": 0},
+        {"random_seed": 1.5},
     ],
 )
 def test_runtime_rejects_invalid_operational_values(values: dict[str, object]) -> None:
@@ -93,7 +106,12 @@ def test_runtime_rejects_invalid_operational_values(values: dict[str, object]) -
         RuntimeConfig(**values)
 
 
-def test_canonical_json_is_stable_and_hash_tracks_behavior_parameters() -> None:
+def test_runtime_rejects_model_thinking_in_v0_1() -> None:
+    with pytest.raises(ValidationError, match="v0.1 requires model_thinking=false"):
+        RuntimeConfig(model_thinking=True)
+
+
+def test_canonical_json_is_canonically_ordered_and_hash_tracks_behavior_parameters() -> None:
     config = load_run_config(Path("driftroom.example.toml"))
     canonical = canonical_config_json(config)
 
@@ -128,8 +146,10 @@ def test_canonical_json_matches_independently_written_expected_string() -> None:
 
     expected = (
         '{"agents":[' + ",".join(agent(ident) for ident in "abc") + "],"
-        '"runtime":{"inference_timeout_seconds":120.0,"max_output_tokens":256,'
-        '"model_thinking":false,"recent_context_events":20,"retry_count":1,'
+        '"runtime":{"clock_mode":"realtime","clock_speed":1.0,'
+        '"inference_timeout_seconds":120.0,"max_context_tokens":8192,'
+        '"max_output_tokens":256,"model_thinking":false,"random_seed":null,'
+        '"recent_context_events":20,"retry_count":1,'
         '"runtime_mode":"balanced","startup_mode":"blank"},'
         '"scheduler":{"ambient_min_interval_ms":900000,"base_bias":-0.35,'
         '"candidate_threshold":0.2,"cooldown_penalty":1.0,"decision_tick_ms":5000,'
@@ -164,7 +184,110 @@ def test_toml_and_constructor_configs_hash_identically() -> None:
                 ("ada", "Ada", 0.5, 0.9, 0.4, 0.35, 0.6),
             ]
         ],
-        runtime=RuntimeConfig(inference_timeout_seconds=120),
     )
 
     assert run_config_hash(built) == run_config_hash(loaded)
+
+
+def _fingerprint_config() -> RunConfig:
+    return RunConfig(
+        agents=[AgentConfig(id=ident, name=ident.upper(), model="m") for ident in "abc"]
+    )
+
+
+_BASE_DIGESTS = {"m": "sha256:aaa", "n": None}
+
+
+def _baseline_fingerprint(config: RunConfig | None = None, **overrides: object) -> str:
+    kwargs: dict[str, object] = {
+        "prompt_hash": "p" * 64,
+        "model_digests": dict(_BASE_DIGESTS),
+        "engine_version": "driftroom-engine-test",
+    }
+    kwargs.update(overrides)
+    return run_fingerprint(config or _fingerprint_config(), **kwargs)  # type: ignore[arg-type]
+
+
+def test_run_fingerprint_is_sha256_hex_and_equal_for_equal_inputs() -> None:
+    first = _baseline_fingerprint(_fingerprint_config())
+    second = _baseline_fingerprint(_fingerprint_config())
+
+    assert len(first) == 64
+    assert all(char in "0123456789abcdef" for char in first)
+    assert first == second
+
+
+def test_run_fingerprint_defaults_engine_version_constant() -> None:
+    config = _fingerprint_config()
+    explicit = run_fingerprint(
+        config, prompt_hash="p", model_digests={}, engine_version=ENGINE_VERSION
+    )
+
+    assert ENGINE_VERSION == "driftroom-engine-0.1.0"
+    assert run_fingerprint(config, prompt_hash="p", model_digests={}) == explicit
+
+
+def _with(mutate: Callable[[RunConfig], None]) -> RunConfig:
+    config = _fingerprint_config()
+    mutate(config)
+    return config
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        pytest.param(
+            lambda: _baseline_fingerprint(
+                _with(lambda c: setattr(c.agents[0].sampling, "temperature", 0.81))
+            ),
+            id="sampling",
+        ),
+        pytest.param(
+            lambda: _baseline_fingerprint(
+                _with(lambda c: setattr(c.scheduler, "decision_tick_ms", 5001))
+            ),
+            id="scheduler",
+        ),
+        pytest.param(
+            lambda: _baseline_fingerprint(
+                _with(lambda c: setattr(c.runtime, "random_seed", 7))
+            ),
+            id="random_seed",
+        ),
+        pytest.param(
+            lambda: _baseline_fingerprint(
+                _with(lambda c: setattr(c.runtime, "clock_mode", "accelerated"))
+            ),
+            id="clock_mode",
+        ),
+        pytest.param(
+            lambda: _baseline_fingerprint(
+                _with(lambda c: setattr(c.runtime, "clock_speed", 2.0))
+            ),
+            id="clock_speed",
+        ),
+        pytest.param(
+            lambda: _baseline_fingerprint(
+                _with(lambda c: setattr(c.runtime, "max_context_tokens", 4096))
+            ),
+            id="max_context_tokens",
+        ),
+        pytest.param(lambda: _baseline_fingerprint(prompt_hash="q" * 64), id="prompt_hash"),
+        pytest.param(
+            lambda: _baseline_fingerprint(model_digests={"m": "sha256:bbb", "n": None}),
+            id="model_digest_changed",
+        ),
+        pytest.param(
+            lambda: _baseline_fingerprint(model_digests={"m": "sha256:aaa", "n": "sha256:ccc"}),
+            id="model_digest_none_to_value",
+        ),
+        pytest.param(
+            lambda: _baseline_fingerprint(engine_version="driftroom-engine-other"),
+            id="engine_version",
+        ),
+    ],
+)
+def test_run_fingerprint_changes_when_any_single_input_changes(
+    variant: Callable[[], str],
+) -> None:
+    assert variant() != _baseline_fingerprint()
