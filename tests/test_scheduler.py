@@ -434,6 +434,64 @@ def test_an_agent_copying_another_agents_message_is_self_damped_without_the_room
     assert "self_repetition" not in scores["milo"].reasons
 
 
+def echo_then_fresh_messages(fresh: int) -> list[StoredEvent]:
+    # June copies Ada's line (her message is index 1 of the recent messages), then
+    # ``fresh`` mutually dissimilar messages by other speakers follow.
+    texts = [f"w{n}a w{n}b w{n}c" for n in range(fresh)]
+    speakers = ["ada", "milo"]
+    events = [message(1, 0, "ada", LOOP_A), message(2, 5_000, "june", LOOP_A_COPY)]
+    events += [
+        message(3 + n, 10_000 + 5_000 * n, speakers[n % 2], text)
+        for n, text in enumerate(texts)
+    ]
+    return events
+
+
+def test_self_repetition_still_fires_at_the_window_boundary_and_not_one_message_later() -> None:
+    scheduler = Scheduler(neutral_config(repetition_window=3), rng=Random(3))
+
+    # recent = [A, A', f0, f1]: June's message is the oldest of the last 3 entries.
+    at_boundary = score_by_agent(scheduler, echo_then_fresh_messages(2))
+    # recent = [A, A', f0, f1, f2]: it has just left the last 3 entries.
+    past_boundary = score_by_agent(scheduler, echo_then_fresh_messages(3))
+
+    assert "self_repetition" in at_boundary["june"].reasons
+    assert at_boundary["june"].score == pytest.approx(-0.5)
+    assert all("repetition" not in c.reasons for c in past_boundary.values())
+    assert "self_repetition" not in past_boundary["june"].reasons
+    assert past_boundary["june"].score == 0
+
+
+def test_a_one_time_echoer_recovers_after_the_window_not_after_the_visible_history() -> None:
+    config = load_run_config(EXAMPLE_CONFIG)
+    assert config.scheduler.repetition_window == 5
+    scheduler = Scheduler(config.scheduler, rng=Random(1))
+    now_ms = 10_300_000
+
+    def echo_scene(fresh: int) -> list[StoredEvent]:
+        texts = [f"w{n}a w{n}b w{n}c" for n in range(fresh)]
+        events = [
+            message(1, 10_000_000, "ada", LOOP_A),
+            message(2, 10_005_000, "milo", LOOP_A_COPY),  # Milo echoes Ada once
+        ]
+        events += [
+            message(3 + n, 10_010_000 + 5_000 * n, ("june", "ada")[n % 2], text)
+            for n, text in enumerate(texts)
+        ]
+        return events
+
+    still_damped = echo_scene(4)  # Milo's message is the oldest of the last 5
+    recovered = echo_scene(5)  # it has left the last 5
+
+    scores = {s.agent_id: s for s in scheduler.score_agents(config.agents, still_damped, now_ms)}
+    assert "self_repetition" in scores["milo"].reasons
+    scores = {s.agent_id: s for s in scheduler.score_agents(config.agents, recovered, now_ms)}
+    assert "self_repetition" not in scores["milo"].reasons
+    assert all("repetition" not in s.reasons for s in scores.values())
+    draws = [scheduler.select_candidate(config.agents, recovered, now_ms) for _ in range(2_000)]
+    assert any(c is not None and c.agent_id == "milo" for c in draws)
+
+
 def test_self_repetition_is_off_when_damping_is_zero() -> None:
     scheduler = Scheduler(neutral_config(repetition_damping=0), rng=Random(3))
 

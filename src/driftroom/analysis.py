@@ -13,7 +13,7 @@ from statistics import fmean, median
 
 from .domain import VISIBLE_EVENT_TYPES, is_ambient_event
 from .storage import EventStore, StoredEvent
-from .text import jaccard, token_set, tokens
+from .text import echoes_recent, jaccard, token_set, tokens
 
 
 PAGE_SIZE = 1_000
@@ -68,7 +68,7 @@ class RunMetrics:
     # Observer-only and descriptive (spec §36): no environment reset here.
     repeated_message_ratio: float
     distinct_token_ratio: float
-    self_repetition_ratio: float
+    same_speaker_repetition_ratio: float
 
 
 def _read_all(store: EventStore, run_id: str) -> list[StoredEvent]:
@@ -108,10 +108,7 @@ def analyze_run(store: EventStore, run_id: str) -> RunMetrics:
     window = run.config.scheduler.repetition_window
     repeats = sum(
         1 for index in range(1, len(token_sets))
-        if any(
-            jaccard(token_sets[index], earlier) >= threshold
-            for earlier in token_sets[max(0, index - window):index]
-        )
+        if echoes_recent(index, token_sets, window, threshold)
     )
     last_by_speaker: dict[str | None, set[str]] = {}
     self_comparisons = self_repeats = 0
@@ -160,5 +157,5 @@ def analyze_run(store: EventStore, run_id: str) -> RunMetrics:
         distinct_token_ratio=(
             len(set().union(*token_sets)) / token_total if token_total else 0.0
         ),
-        self_repetition_ratio=self_repeats / self_comparisons if self_comparisons else 0.0,
+        same_speaker_repetition_ratio=self_repeats / self_comparisons if self_comparisons else 0.0,
     )

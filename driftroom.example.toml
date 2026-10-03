@@ -66,7 +66,7 @@ wait_cooldown_ms = 90000
 # overlap entirely (and damps every message).
 repetition_similarity_threshold = 0.6
 repetition_damping = 0.5
-repetition_window = 5  # preceding messages (since the last environment event) compared; 1 = pairwise
+repetition_window = 5  # preceding messages (since the last environment event) compared; 1 = pairwise ROOM rule (copier still gets self_repetition)
 
 [runtime]
 startup_mode = "blank"  # blank | environment | topic ("custom" is reserved)

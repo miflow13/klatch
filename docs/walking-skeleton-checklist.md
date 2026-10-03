@@ -181,12 +181,14 @@ Copy from the run's `session_started` event(s) in the jsonl export.
   >= `repetition_similarity_threshold` (0.6) to any of the preceding window messages, every agent's
   score loses `repetition_damping` (0.5) with reason `repetition`; (2) an agent whose own last message
   is that similar to any of the window messages before it loses `repetition_damping` with reason
-  `self_repetition` (both can stack). An environment event (ambient or startup line) restarts both
-  rules, so a looping room goes quiet and recovers on the next ambient event. Window 1 is the old
-  pairwise rule. The topic-overlap term is capped (contributes nothing above that threshold; 0
-  disables it) and is unchanged.
+  `self_repetition` (both can stack), but only while that message is itself among the last
+  `repetition_window` messages, so a one-time echoer recovers after that many fresh messages by
+  others. An environment event (ambient or startup line) restarts both rules, so a looping room
+  goes quiet and recovers on the next ambient event. Window 1 is the pairwise ROOM rule (the
+  copier still gets `self_repetition`). The topic-overlap term is capped (contributes nothing
+  above that threshold; 0 disables it) and is unchanged.
 - `analyze_run` reports `repeated_message_ratio` (now windowed: similarity to any of the previous
-  `repetition_window` messages), `distinct_token_ratio`, and `self_repetition_ratio` (messages similar
+  `repetition_window` messages), `distinct_token_ratio`, and `same_speaker_repetition_ratio` (messages similar
   to their speaker's previous message, among messages with an earlier message by that speaker).
   Baselines:
   - gate-4 (engine 0.1.3): consecutive-pair `repeated_message_ratio` = 0.69 ; `distinct_token_ratio` = 0.09

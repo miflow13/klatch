@@ -122,7 +122,7 @@ def test_analyze_run_reports_every_metric_for_a_synthetic_run(store) -> None:
         median_inference_ms=300.0,
         repeated_message_ratio=0.0,
         distinct_token_ratio=1.0,  # 15 tokens over three messages, none repeated
-        self_repetition_ratio=0.0,
+        same_speaker_repetition_ratio=0.0,
     )
     assert set(reader.calls) == {"read_events", "get_run"}
 
@@ -139,7 +139,7 @@ def test_empty_run_has_zero_counts_and_no_inference_mean(store) -> None:
         assistant_phrase_hits=0, as_an_ai_hits=0, silence_periods=0, ambient_events=0,
         mean_inference_ms=None, failure_classes={},
         decisions_per_sim_minute=0.0, wait_ratio=0.0, median_inference_ms=None,
-        repeated_message_ratio=0.0, distinct_token_ratio=0.0, self_repetition_ratio=0.0,
+        repeated_message_ratio=0.0, distinct_token_ratio=0.0, same_speaker_repetition_ratio=0.0,
     )
 
 
@@ -357,13 +357,13 @@ def _alternating_loop(store: EventStore, run_id: str = "run-1") -> None:
                                        "latency_ms": 1.0}, speaker, run_id=run_id)
 
 
-def test_an_alternating_loop_is_repeated_over_the_window_and_every_repeat_is_a_self_copy(store) -> None:
+def test_an_alternating_loop_is_repeated_over_the_window_and_every_repeat_is_a_same_speaker_copy(store) -> None:
     _alternating_loop(store)
 
     metrics = analyze_run(store, "run-1")
 
     assert metrics.repeated_message_ratio == pytest.approx(2 / 3)  # window 5: A' and B' of 3 pairs
-    assert metrics.self_repetition_ratio == 1.0  # A' and B' both copy their speaker's last line
+    assert metrics.same_speaker_repetition_ratio == 1.0  # A' and B' both copy their speaker's last line
 
 
 def test_repeated_ratio_with_window_one_is_the_consecutive_pair_definition(store) -> None:
@@ -375,23 +375,23 @@ def test_repeated_ratio_with_window_one_is_the_consecutive_pair_definition(store
     metrics = analyze_run(store, "run-narrow")
 
     assert metrics.repeated_message_ratio == 0.0
-    assert metrics.self_repetition_ratio == 1.0  # the self metric does not depend on the window
+    assert metrics.same_speaker_repetition_ratio == 1.0  # the self metric does not depend on the window
 
 
-def test_disjoint_messages_have_no_self_repetition(store) -> None:
+def test_disjoint_messages_have_no_same_speaker_repetition(store) -> None:
     add(store, "session_started", 0)
     say(store, "june", 0, "alpha bravo")
     say(store, "milo", 5_000, "charlie delta")
     say(store, "ada", 10_000, "echo foxtrot")
 
-    assert analyze_run(store, "run-1").self_repetition_ratio == 0.0
+    assert analyze_run(store, "run-1").same_speaker_repetition_ratio == 0.0
 
 
-def test_self_repetition_counts_only_messages_with_an_earlier_message_by_the_same_speaker(store) -> None:
+def test_same_speaker_repetition_counts_only_messages_with_an_earlier_message_by_the_same_speaker(store) -> None:
     add(store, "session_started", 0)
     say(store, "june", 0, "alpha bravo charlie")
     say(store, "milo", 5_000, "alpha bravo charlie")  # copies June, but Milo has no earlier message
     say(store, "june", 10_000, "zulu yankee xray")  # June, no repeat
     say(store, "milo", 15_000, "alpha bravo charlie")  # Milo copies his own previous line
 
-    assert analyze_run(store, "run-1").self_repetition_ratio == 0.5  # 1 of 2 eligible messages
+    assert analyze_run(store, "run-1").same_speaker_repetition_ratio == 0.5  # 1 of 2 eligible messages

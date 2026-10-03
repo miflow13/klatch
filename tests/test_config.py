@@ -116,7 +116,7 @@ def test_runtime_rejects_invalid_operational_values(values: dict[str, object]) -
 
 @pytest.mark.parametrize("values", [{"repetition_window": 0}, {"repetition_window": -1}])
 def test_scheduler_rejects_a_repetition_window_below_one(values: dict[str, object]) -> None:
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match="greater than or equal to 1"):
         SchedulerConfig(**values)
 
 

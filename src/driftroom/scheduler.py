@@ -9,18 +9,7 @@ import time
 from .clock import VirtualClock
 from .domain import VISIBLE_EVENT_TYPES, AgentConfig, SchedulerConfig
 from .storage import StoredEvent
-from .text import jaccard, token_set
-
-
-def _echoes_recent(
-    index: int, texts: Sequence[set[str]], window: int, threshold: float
-) -> bool:
-    """True when ``texts[index]`` is at least ``threshold`` alike to any of the
-    ``window`` token sets just before it."""
-    return any(
-        jaccard(texts[index], earlier) >= threshold
-        for earlier in texts[max(0, index - window):index]
-    )
+from .text import echoes_recent, token_set
 
 
 @dataclass(frozen=True)
@@ -72,14 +61,16 @@ class Scheduler:
             str(latest_message.payload.get("message", ""))
             if latest_message is not None else ""
         )
-        latest_tokens = token_set(latest_text)
         # Repetition (spec §36), over the messages after the last environment event
         # (an ambient or startup line restarts both rules, so a looping room recovers):
         # - room: the latest message echoes one of the preceding ``repetition_window``
         #   messages, so every agent's urge to add another drops ("repetition");
-        # - self: an agent's own last message echoes one of the preceding window
-        #   messages, so that agent's urge drops further ("self_repetition").
-        # A window of 1 is the pairwise rule; both use the similarity threshold and damping.
+        # - self: an agent's own last message echoes one of the preceding window messages
+        #   AND is itself among the last ``repetition_window`` messages, so that agent's
+        #   urge drops further ("self_repetition") until that many fresh messages by
+        #   others have followed.
+        # A window of 1 is the pairwise room rule (a copier still gets self_repetition);
+        # both rules use the similarity threshold and damping.
         last_environment = max(
             (i for i, event in enumerate(visible) if event.type == "environment"),
             default=-1,
@@ -88,9 +79,12 @@ class Scheduler:
         recent_sets = [token_set(str(event.payload.get("message", ""))) for event in recent]
         window = self.config.repetition_window
         threshold = self.config.repetition_similarity_threshold
-        repeating = len(recent) >= 2 and _echoes_recent(
+        repeating = len(recent) >= 2 and echoes_recent(
             len(recent) - 1, recent_sets, window, threshold
         )
+        # Only a message can be echoed or matched; an environment event as the latest
+        # visible event leaves no latest tokens.
+        latest_tokens = recent_sets[-1] if latest_message is not None else set()
         scores = []
         for agent in agents:
             score = self.config.base_bias
@@ -141,8 +135,8 @@ class Scheduler:
             own_recent = [i for i, event in enumerate(recent) if event.agent_id == agent.id]
             if (
                 own_recent
-                and own_recent[-1] >= 1
-                and _echoes_recent(own_recent[-1], recent_sets, window, threshold)
+                and own_recent[-1] >= max(1, len(recent) - window)
+                and echoes_recent(own_recent[-1], recent_sets, window, threshold)
                 and self.config.repetition_damping
             ):
                 score -= self.config.repetition_damping

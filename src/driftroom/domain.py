@@ -75,7 +75,8 @@ class SchedulerConfig(StrictModel):
     repetition_similarity_threshold: float = Field(default=0.6, ge=0, le=1)
     repetition_damping: float = Field(default=0.5, ge=0)
     # How many preceding messages (since the last environment event) the repetition rules
-    # compare against; 1 reproduces the pairwise rule.
+    # compare against; 1 = the pairwise ROOM rule (the copier still gets self_repetition).
+    # The self rule also lapses once the agent's echo is older than the last this-many messages.
     repetition_window: int = Field(default=5, ge=1)
 
 
