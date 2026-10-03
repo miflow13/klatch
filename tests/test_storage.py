@@ -130,6 +130,22 @@ def test_state_update_cannot_cross_event_run(tmp_path, table: str) -> None:
     store.close()
 
 
+def test_key_only_state_update_is_rejected_before_sql(tmp_path) -> None:
+    path = tmp_path / "room.sqlite3"
+    store = EventStore(path)
+    store.initialize()
+    store.create_run(run_record())
+
+    with pytest.raises(ValueError, match="non-key"):
+        store.commit_event(
+            message(100),
+            [StateUpdate(table="agent_state", values={"run_id": "run-1", "agent_id": "june"})],
+        )
+
+    assert store.read_events("run-1") == []
+    store.close()
+
+
 def test_memory_source_event_must_belong_to_update_run(tmp_path) -> None:
     path = tmp_path / "room.sqlite3"
     store = EventStore(path)

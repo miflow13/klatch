@@ -209,6 +209,8 @@ class EventStore:
         values = update.values
         if not values or not set(values) <= _STATE_COLUMNS[table] or not set(_STATE_KEYS[table]) <= set(values):
             raise ValueError(f"invalid columns for {table}")
+        if set(values) <= set(_STATE_KEYS[table]):
+            raise ValueError(f"state update for {table} must include at least one non-key column")
         if values["run_id"] != event_run_id:
             raise ValueError("state update run_id must match event run_id")
         if table == "memories":
