@@ -65,6 +65,7 @@ def test_experimental_v1_scheduler_defaults_are_recorded() -> None:
         "silence_ambient_after_ms": 300_000,
         "ambient_min_interval_ms": 900_000,
         "speaker_cooldown_ms": 20_000,
+        "wait_cooldown_ms": 90_000,
     }
 
 
@@ -148,6 +149,53 @@ def test_speaker_and_decision_cooldowns_apply_at_most_one_penalty() -> None:
     assert both.score == pytest.approx(-1.0)
     assert both.reasons == ("cooldown",)
     assert selected is None
+
+
+def test_recent_wait_applies_wait_cooldown_until_configured_boundary() -> None:
+    june = agent("june", "June")
+    scheduler = Scheduler(
+        neutral_config(cooldown_penalty=1.0, speaker_cooldown_ms=20_000, wait_cooldown_ms=90_000),
+        rng=Random(3),
+    )
+
+    fresh = scheduler.score_agents([june], [], 100_000)[0]
+    inside = scheduler.score_agents([june], [], 100_000, last_wait_ms={"june": 90_000})[0]
+    boundary = scheduler.score_agents([june], [], 100_000, last_wait_ms={"june": 10_000})[0]
+    selected = scheduler.select_candidate([june], [], 100_000, last_wait_ms={"june": 90_000})
+
+    assert fresh.score - inside.score == pytest.approx(1.0)
+    assert inside.reasons == ("wait_cooldown",)
+    assert boundary == fresh and "wait_cooldown" not in boundary.reasons
+    assert selected is None
+
+
+def test_recent_speech_and_wait_apply_a_single_speaker_cooldown() -> None:
+    june = agent("june", "June")
+    scheduler = Scheduler(
+        neutral_config(cooldown_penalty=1.0, speaker_cooldown_ms=20_000, wait_cooldown_ms=90_000),
+        rng=Random(3),
+    )
+    spoke = [message(1, 90_000, "june", "hi")]
+
+    both = scheduler.score_agents([june], spoke, 100_000, last_wait_ms={"june": 95_000})[0]
+
+    assert both.score == pytest.approx(-1.0)
+    assert both.reasons == ("cooldown",)
+
+
+def test_failed_generation_shadows_an_older_wait_with_one_decision_cooldown() -> None:
+    june = agent("june", "June")
+    scheduler = Scheduler(
+        neutral_config(cooldown_penalty=1.0, speaker_cooldown_ms=20_000, wait_cooldown_ms=90_000),
+        rng=Random(3),
+    )
+
+    failed = scheduler.score_agents(
+        [june], [], 100_000, last_decision_ms={"june": 95_000}, last_wait_ms={"june": 30_000}
+    )[0]
+
+    assert failed.score == pytest.approx(-1.0)
+    assert failed.reasons == ("decision_cooldown",)
 
 
 def test_latest_speaker_gets_recent_participation_penalty() -> None:

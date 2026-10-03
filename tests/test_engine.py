@@ -529,7 +529,8 @@ def test_agents_are_not_reasked_within_the_cooldown_of_their_last_decision(tmp_p
 def test_restart_restores_decision_cooldowns_from_persisted_events(tmp_path) -> None:
     # Forced regime: every agent scores 1.0 unless cooling down (score 0, below
     # threshold), so selection runs june, milo, ada, idle, june, ... in config order.
-    config = make_config({**FORCED, "cooldown_penalty": 1.0})
+    # A 20 s wait cooldown keeps that cycle short enough to span three sessions.
+    config = make_config({**FORCED, "cooldown_penalty": 1.0, "wait_cooldown_ms": 20_000})
     store = open_store(tmp_path / "room.sqlite3")
     store.initialize()
     asked: list[str] = []
@@ -547,6 +548,50 @@ def test_restart_restores_decision_cooldowns_from_persisted_events(tmp_path) -> 
     # Without restored cooldowns the second session would re-ask june at 10 s.
     assert asked == ["june", "milo", "ada", "june", "milo"]
     assert min(decision_gaps(store)) >= config.scheduler.speaker_cooldown_ms
+
+
+def test_an_all_wait_room_is_asked_at_most_once_per_wait_cooldown(tmp_path) -> None:
+    config = make_config()
+    wait_cooldown = config.scheduler.wait_cooldown_ms
+    backend = RecordingBackend([WAIT] * 2_000)
+    engine, store, clock = make_engine(tmp_path, config, backend)
+    engine.start()
+
+    steps = 0
+    while clock.now_ms() < 7_200_000:
+        engine.step()
+        steps += 1
+
+    assert steps >= 7_200_000 // config.scheduler.decision_tick_ms
+    assert 1 <= len(backend.calls) <= 3 * (7_200_000 // wait_cooldown) + 3
+    assert len(backend.calls) == types(store).count("agent_wait")
+    gaps = decision_gaps(store)
+    assert gaps and min(gaps) >= wait_cooldown
+
+
+def test_restart_restores_wait_cooldowns_from_persisted_events(tmp_path) -> None:
+    # Forced regime: june (first in config order) always wins unless cooling down.
+    config = make_config({**FORCED, "cooldown_penalty": 1.0})
+    wait_cooldown = config.scheduler.wait_cooldown_ms
+    first, store, _ = make_engine(tmp_path, config, RecordingBackend([WAIT]))
+    first.start()
+    assert first.step().kind == "wait"
+    first.stop()
+    store.close()
+
+    reopened = open_store(tmp_path / "room.sqlite3")
+    backend = RecordingBackend([WAIT] * 10)
+    engine = SimulationEngine(
+        config, reopened, backend, run_id="run-1", room_id="room-1",
+        wall_clock=lambda: WALL, sleep_fn=forbidden_sleep,
+    )
+    engine.start()
+    while engine.clock.now_ms() < wait_cooldown:
+        engine.step()
+
+    june_waits = [e.sim_ms for e in events(reopened) if e.type == "agent_wait" and e.agent_id == "june"]
+    assert june_waits == [0]
+    assert [agent.id for agent, _ in backend.calls] == ["milo", "ada"]
 
 
 def test_restart_resumes_from_last_persisted_time_without_offline_events(tmp_path) -> None:

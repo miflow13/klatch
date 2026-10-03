@@ -74,9 +74,10 @@ class SimulationEngine:
         self._ended = False
         self._last_visible_ms: int | None = None
         self._last_ambient_ms: int | None = None
-        # Per-agent sim_ms of the last committed decision (speak, wait, or failed
-        # generation), fed to the scheduler's decision cooldown.
+        # Per-agent sim_ms of the last speech or failed generation (decision
+        # cooldown) and of the last wait (wait cooldown), fed to the scheduler.
         self._last_decision_ms: dict[str, int] = {}
+        self._last_wait_ms: dict[str, int] = {}
 
     def start(self) -> int:
         runtime = self.config.runtime
@@ -98,7 +99,7 @@ class SimulationEngine:
             )
         if self.scheduler is None:
             self.scheduler = Scheduler(self.config.scheduler, rng=Random(runtime.random_seed))
-        # Restore decision cooldowns so a restart does not immediately re-ask everyone.
+        # Restore decision and wait cooldowns so a restart does not immediately re-ask everyone.
         for event in self.store.read_recent_events(self.run_id, runtime.recent_context_events):
             self._remember_decision(event.type, event.agent_id, event.sim_ms)
         prompt_hash = self._prompt_hash = prompt_template_hash()
@@ -154,7 +155,8 @@ class SimulationEngine:
             return EngineStepResult("ambient", self._commit("environment", None, now, {"text": AMBIENT_SILENCE_TEXT}))
         candidate = self.scheduler.select_from(
             self.scheduler.score_agents(
-                self.config.agents, recent, now, last_decision_ms=self._last_decision_ms
+                self.config.agents, recent, now,
+                last_decision_ms=self._last_decision_ms, last_wait_ms=self._last_wait_ms,
             )
         )
         if candidate is None:
@@ -254,8 +256,15 @@ class SimulationEngine:
         # A failed generation is not social silence and leaves social metrics alone,
         # but for scheduling it was this agent's turn: without the cooldown a
         # failing agent would be re-asked every tick and starve the others (§35).
-        if event_type in ("agent_wait", "message", "generation_failed") and agent_id is not None:
+        # A wait gets its own, longer cooldown so a quiet room stays quiet (§15);
+        # it must not also land in the decision map, whose shorter window would
+        # shadow it.
+        if agent_id is None:
+            return
+        if event_type in ("message", "generation_failed"):
             self._last_decision_ms[agent_id] = sim_ms
+        elif event_type == "agent_wait":
+            self._last_wait_ms[agent_id] = sim_ms
 
     def _commit(
         self, event_type: str, agent_id: str | None, sim_ms: int, payload: dict[str, object]

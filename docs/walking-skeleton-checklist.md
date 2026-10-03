@@ -37,14 +37,16 @@ driftroom start --db room.sqlite3 --config driftroom.example.toml
 >
 > - `candidate_threshold` defaults to **0.20**, lowered from the plan's 0.35 because the room
 >   was provably dormant at 0.35.
-> - An agent is not re-asked within `speaker_cooldown_ms` (20 s) of its last decision, whether
->   it spoke, waited, or its generation failed.
+> - An agent is not re-asked within `speaker_cooldown_ms` (20 s) after it spoke or its
+>   generation failed, nor within `wait_cooldown_ms` (90 s) after it chose to WAIT. A mention
+>   does not cut a cooldown short (the 1.00 penalty outweighs the 0.55 mention bonus).
 > - The realtime clock freezes while the room is paused: resuming adds no simulated time, no
 >   silence cue and no ambient event for the paused interval.
 > - Expected asking cadence when every agent always WAITs, under the defaults: about
->   **5.4 model calls per simulated minute** (one every ~11 s; 5.32–5.47 over seeds 1–5 of a
->   2-hour accelerated run), plus one ambient line every 15 minutes. In realtime each call
->   also waits for inference, so the wall-clock rate is lower.
+>   **1.7 model calls per simulated minute** (one every ~36 s; 1.65–1.72 over seeds 1–5 of a
+>   2-hour accelerated run, bounded by the wait cooldown at 2 per minute for three agents),
+>   plus one ambient line every 15 minutes. In realtime each call also waits for inference,
+>   so the wall-clock rate is lower.
 
 ## 1. Prerequisites
 

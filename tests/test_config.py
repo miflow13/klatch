@@ -168,7 +168,8 @@ def test_canonical_json_matches_independently_written_expected_string() -> None:
         '"direct_mention_bonus":0.55,"elapsed_weight":0.3,"random_jitter":0.15,'
         '"recent_speaker_penalty":0.45,"relationship_weight":0.1,'
         '"silence_ambient_after_ms":300000,"speaker_cooldown_ms":20000,'
-        '"talkativeness_weight":0.45,"topic_overlap_weight":0.25}}'
+        '"talkativeness_weight":0.45,"topic_overlap_weight":0.25,'
+        '"wait_cooldown_ms":90000}}'
     )
 
     assert canonical_config_json(config) == expected

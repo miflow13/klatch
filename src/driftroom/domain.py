@@ -54,6 +54,7 @@ class SchedulerConfig(StrictModel):
     silence_ambient_after_ms: int = Field(default=300_000, gt=0)
     ambient_min_interval_ms: int = Field(default=900_000, gt=0)
     speaker_cooldown_ms: int = Field(default=20_000, ge=0)
+    wait_cooldown_ms: int = Field(default=90_000, ge=0)
 
 
 class RuntimeConfig(StrictModel):
