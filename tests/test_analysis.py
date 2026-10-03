@@ -199,3 +199,36 @@ def test_analysis_pages_through_every_event(store, monkeypatch) -> None:
 
     assert metrics.visible_messages == 7
     assert metrics.messages_per_agent["june"] == 7
+
+
+@pytest.mark.parametrize("text", [
+    "That's a great point and It's important to note it",
+    "That’s a great point and It’s important to note it",
+    "That’s a great point and It's important to note it",
+])
+def test_apostrophe_phrases_match_straight_and_curly_apostrophes(store, text) -> None:
+    say(store, "june", 0, text)
+    before = all_events(store)
+
+    metrics = analyze_run(store, "run-1")
+
+    assert (metrics.assistant_phrase_hits, metrics.as_an_ai_hits) == (2, 0)
+    assert all_events(store) == before  # the stored text keeps its original apostrophes
+
+
+def test_message_from_an_agent_outside_the_run_config_is_counted_under_its_id(store) -> None:
+    say(store, "june", 0, "hi")
+    say(store, "stranger", 1_000, "who am I")
+    say(store, "stranger", 2_000, "still here")
+
+    metrics = analyze_run(store, "run-1")
+
+    assert metrics.messages_per_agent == {"june": 1, "milo": 0, "ada": 0, "stranger": 2}
+    assert metrics.visible_messages == 3
+
+
+def test_message_without_an_agent_id_is_a_value_error_not_an_assertion(store) -> None:
+    event_id = add(store, "message", 0, {"speaker": "?", "message": "hi", "target": None, "latency_ms": 1.0})
+
+    with pytest.raises(ValueError, match=f"message event {event_id} has no agent"):
+        analyze_run(store, "run-1")

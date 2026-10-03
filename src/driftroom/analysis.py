@@ -29,8 +29,10 @@ ASSISTANT_PHRASES: tuple[str, ...] = (
 
 
 def _phrase_pattern(phrase: str) -> re.Pattern[str]:
-    # Whole phrase, case-insensitive: "as an aide" is not "as an AI".
-    return re.compile(rf"(?<!\w){re.escape(phrase)}(?!\w)", re.IGNORECASE)
+    # Whole phrase, case-insensitive: "as an aide" is not "as an AI". A straight
+    # apostrophe in the phrase also matches a curly one; the scanned text is never changed.
+    body = "['’]".join(re.escape(part) for part in phrase.split("'"))
+    return re.compile(rf"(?<!\w){body}(?!\w)", re.IGNORECASE)
 
 
 _ASSISTANT_PATTERNS = tuple(_phrase_pattern(phrase) for phrase in ASSISTANT_PHRASES)
@@ -84,7 +86,8 @@ def analyze_run(store: EventStore, run_id: str) -> RunMetrics:
     words = [len(text.split()) for text in texts]
     per_agent = {agent.id: 0 for agent in run.config.agents}
     for event in messages:
-        assert event.agent_id is not None, f"message event {event.id} has no agent"
+        if event.agent_id is None:
+            raise ValueError(f"message event {event.id} has no agent")
         per_agent[event.agent_id] = per_agent.get(event.agent_id, 0) + 1
     latencies = [
         float(event.payload["latency_ms"])

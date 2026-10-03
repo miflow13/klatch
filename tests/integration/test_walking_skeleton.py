@@ -80,7 +80,8 @@ def all_events(store: EventStore) -> list[StoredEvent]:
 def test_walking_skeleton_survives_pause_resume_and_restart(tmp_path) -> None:
     path = tmp_path / "room.sqlite3"
     config = make_config()
-    tick_s = config.scheduler.decision_tick_ms / 1_000
+    tick_ms = config.scheduler.decision_tick_ms
+    tick_s = tick_ms / 1_000
     queue: list[Decision] = []
     for text in SPOKEN:
         queue += [Decision(action="speak", message=text, target=None)] + [WAIT] * 4
@@ -114,7 +115,8 @@ def test_walking_skeleton_survives_pause_resume_and_restart(tmp_path) -> None:
     later = WALL + timedelta(hours=3)
     restarted = make_engine(config, store, backend, later, sleeps)
     restarted.start()
-    kinds += [restarted.step().kind for _ in range(30)]
+    results = [restarted.step() for _ in range(30)]
+    kinds += [result.kind for result in results]
     restarted.stop()
 
     events = all_events(store)
@@ -136,7 +138,32 @@ def test_walking_skeleton_survives_pause_resume_and_restart(tmp_path) -> None:
     assert ids.index(resumed.id) == ids.index(first_end.id) + 1
     assert resumed.sim_ms == first_end.sim_ms == resumed.payload["sim_start_ms"]
     assert resumed.payload["restart"] is True and resumed.wall_ts == later.isoformat()
-    assert [event for event in events if first_end.sim_ms < event.sim_ms < resumed.sim_ms] == []
+
+    # The restarted session acts (messages or valid waits), it does not just idle.
+    after_restart = [event for event in events if event.id > resumed.id]
+    acted = [event for event in after_restart if event.type in ("message", "agent_wait")]
+    assert acted
+
+    # Downtime is not simulated: no event after the restart jumps in simulation time.
+    # A step advances the accelerated clock by one decision tick after a decision and by
+    # one tick per idle step (an idle step commits nothing), so between two consecutive
+    # events the legitimate advance is one tick plus one per idle step in between, never
+    # more. A wall-clock-driven jump across the 3 h downtime would exceed every such bound.
+    committed = [result.event_id for result in results if result.event_id is not None]
+    assert committed == [event.id for event in after_restart[:-1]]  # one event per acting step
+    idle_before: list[int] = []  # idle steps preceding each event after the restart
+    idle_steps = 0
+    for result in results:
+        if result.event_id is None:
+            idle_steps += 1
+        else:
+            idle_before.append(idle_steps)
+            idle_steps = 0
+    idle_before.append(idle_steps)  # trailing idle steps precede the session_ended from stop()
+    previous = resumed
+    for event, idle in zip(after_restart, idle_before, strict=True):
+        assert 0 <= event.sim_ms - previous.sim_ms <= tick_ms * (1 + idle), (previous, event)
+        previous = event
 
     # Every message text came from the fake queue, in the order it was handed out.
     messages = by_type["message"]
